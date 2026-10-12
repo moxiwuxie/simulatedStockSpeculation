@@ -1,0 +1,26 @@
+# 历史回放交易系统 —— 后端依赖 (版本与本机验证通过的 .venv 一致)
+#
+# 安装:
+#   cd backend
+#   python3 -m venv .venv
+#   source .venv/bin/activate          # Windows: .venv\Scripts\activate
+#   pip install -r requirements.txt
+#
+# 启动: python run.py   (项目根目录, 一键拉起后端 8010 + 前端 5501)
+
+# --- Web 框架 ---
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+websockets==17.1
+
+# --- 配置 / 校验 ---
+pydantic==2.13.5
+pydantic-settings==2.15.0
+
+# --- 行情数据源 (新浪/东财) 与数据处理 ---
+akshare==1.18.96
+pandas==3.0.6
+numpy==2.5.3
+
+# --- 拼音检索 (首字母/全拼搜索) ---
+pypinyin==0.55.0

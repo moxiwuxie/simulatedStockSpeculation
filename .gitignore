@@ -1,0 +1,60 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== 测试 / 覆盖率 =====
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ===== 运行时数据 (SQLite 账户/训练/自选/注册表, 属于本地状态, 不入库) =====
+*.db
+*.sqlite
+*.sqlite3
+backend/app/data/*.db
+backend/app/data/*.db-journal
+
+# ===== 日志 / 临时文件 =====
+*.log
+logs/
+*.tmp
+.DS_Store
+Thumbs.db
+
+# ===== 环境变量 / 密钥 =====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ===== 前端 =====
+node_modules/
+dist/
+.vite/
+*.local
+
+# ===== IDE =====
+.idea/
+.vscode/
+*.swp
+
+# ===== 项目内 AI/工具产物 =====
+.trae/

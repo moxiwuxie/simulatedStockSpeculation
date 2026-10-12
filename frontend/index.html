@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>历史回放交易系统</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css?v=40">
+<!-- Vue 3 global build (包含 template compiler) -->
+<script src="vendor/vue.global.js?v=40"></script>
+<!-- ECharts -->
+<script src="vendor/echarts.min.js?v=40"></script>
+</head>
+<body>
+
+<div id="app">
+  <!-- ============ 顶部 Tab 栏 (账户为右上角圆形入口) ============ -->
+  <nav class="tab-bar">
+    <div class="tab-group">
+      <div v-for="tab in tabs" :key="tab.id"
+           :class="['tab', tab.cls, {active: activeTab === tab.id}]"
+           @click="switchTab(tab.id)">
+        {{ tab.icon }} {{ tab.label }}
+      </div>
+    </div>
+    <div class="tab-spacer"></div>
+    <div class="acct-fab" :class="{active: settingsOpen}"
+         :title="user ? user.username + ' · 设置' : '设置 / 登录'"
+         @click="openSettings()">
+      <span>⚙</span>
+      <span v-if="user" class="fab-badge">{{ user.username.slice(0, 1) }}</span>
+    </div>
+  </nav>
+
+  <!-- ============ 主体行: 侧边栏 + 主内容 (flex-direction: row) ============ -->
+  <div class="app-body">
+  <aside class="sidebar" v-show="activeTab === 'kline'">
+    <div class="search-box">
+      <input type="text" v-model="searchKw" placeholder="🔍 股票/板块 代码·名称·首字母" @input="debounceSearch">
+      <div v-if="searchKw && (searchResults.stocks.length || searchResults.boards.length)" class="search-results">
+        <div v-if="searchResults.stocks.length" class="search-group-title">个股</div>
+        <div v-for="s in searchResults.stocks" :key="'s' + s.code" class="search-item" @click="selectFromSearch(s)">
+          <span class="name">{{ s.name }}</span>
+          <span class="code">{{ s.code }} {{ s.market }}</span>
+        </div>
+        <div v-if="searchResults.boards.length" class="search-group-title">板块</div>
+        <div v-for="b in searchResults.boards" :key="'b' + b.kind + b.label" class="search-item" @click="selectBoardFromSearch(b)">
+          <span class="name">{{ b.name }}</span>
+          <span class="code">
+            <span class="board-tag">{{ b.kind === 'industry' ? '行业' : '概念' }}</span>
+            <span :class="priceClass(b.pct)">{{ b.pct != null ? b.pct.toFixed(2) + '%' : '--' }}</span>
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <div class="watch-list">
+      <div class="wl-title">
+        <span :class="['grp-tag', isDynSelection ? 'dyn' : 'static']">
+          {{ isDynSelection ? '⚡ 动态分组' : '📌 自选分组' }}
+        </span>
+        <select v-model="watchGroupId" class="wl-group-select" @change="switchGroup(watchGroupId)">
+          <optgroup label="📌 自选分组 (静态)">
+            <option v-for="g in watchGroups" :key="'s' + g.id" :value="g.id">{{ g.name }}</option>
+            <option value="__none__">无</option>
+          </optgroup>
+          <optgroup label="⚡ 动态分组 (按指标实时获取)">
+            <option v-for="g in dynGroups" :key="'d' + g.id" :value="dynKey(g.id)">
+              {{ g.name }}{{ g.builtin ? ' · 内置' : '' }}
+            </option>
+          </optgroup>
+        </select>
+      </div>
+      <div class="wl-grp-ops">
+        <input v-model="newGroupName" placeholder="新建自选分组" class="wl-grp-input" @keyup.enter="addGroup">
+        <button class="btn mini" @click="addGroup" title="新建自选分组(静态)">＋</button>
+        <button class="btn mini" @click="openDynEditor()" title="新建动态分组">⚡</button>
+        <button class="btn mini" @click="triggerImport" title="从 txt/csv/tsv/json 文件导入自选">📥 导入</button>
+        <input ref="importFile" type="file" accept=".txt,.csv,.tsv,.json" style="display:none" @change="onImportFile">
+        <button class="btn mini danger" v-if="canDeleteGroup" @click="delGroup()" title="删除当前分组">🗑</button>
+      </div>
+      <div v-if="isDynSelection" class="wl-hint">
+        <span class="grp-count">命中 {{ stocks.length }} 只 · 每次按指标实时获取</span>
+        <button class="btn mini ghost" @click="reloadWatchView(true)">{{ dynLoading ? '获取中...' : '刷新' }}</button>
+        <button class="btn mini ghost" @click="openDynEditor(currentDynGroup)" title="查看/编辑规则">✎</button>
+      </div>
+      <div v-if="!isLoggedIn" class="wl-empty">登录后显示分组</div>
+      <div v-else-if="dynLoading" class="wl-empty">按指标获取中...</div>
+      <div v-else-if="!stocks.length" class="wl-empty">{{ isDynSelection ? '暂无符合条件的个股' : '搜索添加股票' }}</div>
+      <div v-for="s in stocks" :key="s.code"
+           :class="['wl-item', {selected: selectedStock?.code === s.code}]"
+           @click="selectStock(s)">
+        <div class="wl-name">{{ s.name }}</div>
+        <div class="wl-code">
+          <span :class="{up: s.change_pct > 0, down: s.change_pct < 0}">{{ s.change_pct?.toFixed?.(2) ?? '--' }}%</span>
+          <span class="price">¥{{ s.price?.toFixed?.(2) ?? '--' }}</span>
+          <button v-if="!isDynSelection" class="wl-del" @click.stop="removeWatch(s)">✕</button>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ============ 主内容区 ============ -->
+  <main class="main-content">
+
+    <!-- ===== K线 + 分时 Tab (v-show 保证 ECharts 容器始终在 DOM 且有尺寸) ===== -->
+    <section v-show="activeTab === 'kline'" class="pane kline-pane">
+      <div v-if="selectedStock" class="kline-inner">
+        <div class="chart-header">
+          <div class="title">
+            {{ selectedStock.name }}
+            <span class="code" v-if="!selectedStock.isBoard">{{ selectedStock.code }}</span>
+            <span class="board-tag" v-else>板块指数</span>
+          </div>
+          <!-- 板块视图: 指数 + 涨跌 + 区间量额 -->
+          <div class="stats" v-if="selectedStock.isBoard">
+            <span>最新 <b class="v">{{ boardStats?.close ?? '--' }}</b></span>
+            <span>涨跌 <b :class="priceClass(boardStats?.change_pct)">{{ boardStats?.change_pct ?? '--' }}%</b></span>
+            <span>开 {{ boardStats?.open ?? '--' }}</span>
+            <span>高 {{ boardStats?.high ?? '--' }}</span>
+            <span>低 {{ boardStats?.low ?? '--' }}</span>
+            <span>成交量 <b class="v">{{ fmtVol(boardStats?.volume) }}</b></span>
+            <span>成交额 <b class="v">{{ fmtMoney(boardStats?.amount) }}</b></span>
+          </div>
+          <!-- 个股视图 -->
+          <div class="stats" v-else>
+            <span>今开 <span :class="priceClass(selectedStock.change_pct)">{{ selectedStock.open?.toFixed?.(2) }}</span></span>
+            <span>昨收 {{ selectedStock.prev_close?.toFixed?.(2) }}</span>
+            <span>最高 {{ selectedStock.high?.toFixed?.(2) }}</span>
+            <span>最低 {{ selectedStock.low?.toFixed?.(2) }}</span>
+            <span>成交量 <b class="v">{{ fmtVol(selectedStock.volume) }}</b></span>
+            <span>成交额 <b class="v">{{ fmtMoney(selectedStock.amount) }}</b></span>
+          </div>
+          <div class="big-price" :class="priceClass(selectedStock.isBoard ? boardStats?.change_pct : selectedStock.change_pct)">
+            <span v-if="selectedStock.isBoard">指数 {{ boardStats?.close?.toFixed?.(2) ?? '--' }}</span>
+            <span v-else>¥{{ selectedStock.price?.toFixed?.(2) }}</span>
+            <span class="pct">{{ (selectedStock.isBoard ? boardStats?.change_pct : selectedStock.change_pct)?.toFixed?.(2) }}%</span>
+          </div>
+        </div>
+
+        <!-- 选中 K 线日期徽标: 指数信息行下方、周期行上方 -->
+        <div class="kline-date-row" v-if="selectedKlineDate">
+          <span class="kline-date-badge">📌 选中 {{ selectedKlineDate }}</span>
+        </div>
+
+        <!-- 周期切换 + 单根K线查看 + 指标(MACD) -->
+        <div class="ind-bar">
+          <span class="ind-label">周期</span>
+          <button v-for="p in klinePeriods" :key="p.key"
+                  :class="['btn', 'mini', {active: klinePeriod === p.key}]"
+                  @click="setPeriod(p.key)">{{ p.label }}</button>
+          <span class="k-sep"></span>
+          <button class="btn mini" :class="{primary: boardOpen}" @click="toggleBoard">📂 板块</button>
+          <span class="ind-tip">已开启 MACD 指标 · 均线 MA5/10/20/30/60/120/250</span>
+        </div>
+
+        <!-- 板块查询面板 (行业/概念) -->
+        <div class="board-panel" v-show="boardOpen">
+          <div class="board-toolbar">
+            <span class="board-label">板块</span>
+            <button :class="['btn','mini',{active: boardKind==='industry'}]" @click="switchBoardKind('industry')">行业</button>
+            <button :class="['btn','mini',{active: boardKind==='concept'}]" @click="switchBoardKind('concept')">概念</button>
+            <span class="board-count">{{ boardName }}</span>
+            <button class="btn mini ghost" @click="loadBoards">刷新</button>
+          </div>
+          <div class="board-cols">
+            <div class="board-col">
+              <div class="board-col-title">板块列表 ({{ boardListCount }})</div>
+              <input class="board-search" v-model="boardKw" placeholder="🔍 搜行业 / 概念板块"
+                     @input="debounceBoardSearch">
+              <div v-if="boardSearching" class="board-empty">搜索中...</div>
+              <div v-else-if="boardLoading && !boardKw" class="board-empty">加载板块中...</div>
+              <div v-else-if="!boardListCount" class="board-empty">{{ boardKw ? '无匹配板块' : '暂无板块数据' }}</div>
+              <div v-for="b in boardList" :key="(b.kind || boardKind) + (b.label || b.name)"
+                   :class="['board-item', {active: boardName === b.name}]"
+                   @click="selectBoard(b, b.kind || boardKind)">
+                <span class="b-name">{{ b.name }}</span>
+                <span class="b-kind" v-if="boardKw">{{ b.kind === 'industry' ? '行业' : '概念' }}</span>
+                <span :class="priceClass(b.pct)">{{ b.pct?.toFixed?.(2) ?? '--' }}%</span>
+                <span class="b-leader" v-if="b.leader && !boardKw">{{ b.leader }}</span>
+              </div>
+            </div>
+            <div class="board-col">
+              <div class="board-col-title" @click="toggleBoardSort" style="cursor:pointer">
+                成分股 ({{ boardStocks.length }}) · 涨跌幅{{ boardSortedAsc ? '↑ 正序' : '↓ 倒序' }}
+              </div>
+              <div class="board-batch" v-if="boardStocks.length">
+                <label class="bb-all"><input type="checkbox" :checked="boardAllSel"
+                       @change="toggleBoardAll($event.target.checked)"> 全选</label>
+                <span class="bb-count">{{ boardSel.length }} 已选</span>
+                <select class="bb-group" v-model="boardAddGroupId">
+                  <option :value="null">默认分组</option>
+                  <option v-for="g in watchGroups" :key="g.id" :value="g.id">{{ g.name }}</option>
+                </select>
+                <button class="btn mini primary" :disabled="!boardSel.length || boardAdding"
+                        @click="batchAddBoardStocks">加入自选</button>
+              </div>
+              <div v-if="boardConsLoading" class="board-empty">加载成分股中...</div>
+              <div v-else-if="!boardName" class="board-empty">← 点选板块查看成分股</div>
+              <div v-else-if="!boardStocks.length" class="board-empty">暂无成分股</div>
+              <div v-for="s in boardStocks" :key="s.code" class="board-stock" @click="selectBoardStock(s)">
+                <input type="checkbox" class="bs-check" :checked="boardSel.includes(s.code)"
+                       @click.stop @change="toggleBoardSel(s.code)">
+                <span class="s-name">{{ s.name }}</span>
+                <span class="s-pct" :class="priceClass(s.pct)">{{ s.pct?.toFixed?.(2) ?? '--' }}%</span>
+                <span class="s-code">{{ s.code }}</span>
+                <span class="s-price" :class="priceClass(s.pct)">{{ s.price?.toFixed?.(2) ?? '--' }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ECharts 容器: v-show 保证始终 mount 且有尺寸 -->
+        <div id="kline-chart" class="chart-box"></div>
+
+        <div class="pane-sep">
+          <span>⬇️ 点击 K 线蜡烛查看当日分时</span>
+          <span class="pane-amp" v-if="intradayAmp != null"><b>振幅 {{ intradayAmp }}%</b></span>
+          <span class="pane-date">
+            {{ selectedKlineDate || intradayData?.date || '最新交易日' }} 的分时
+            <b v-if="!selectedKlineDate && intradayData?.is_today" class="pane-flag on">当日</b>
+            <b v-else-if="!selectedKlineDate && intradayData" class="pane-flag">上一交易日</b>
+          </span>
+        </div>
+
+        <!-- ECharts 容器内不可有 Vue 管理的子节点: 遮罩层必须是兄弟节点 -->
+        <div class="intraday-wrap" :class="{suspended: intradayData?.suspended}">
+          <div id="intraday-chart" class="chart-box small"></div>
+          <div v-if="intradayLoading" class="pane-empty">⏳ 加载分时中...</div>
+          <div v-else-if="intradayData?.suspended" class="pane-empty warn">⚠️ {{ intradayData.hint || '该日停牌' }}</div>
+          <div v-else-if="!intradayData?.points?.length" class="pane-empty warn">
+            ⚠️ {{ intradayData?.hint || '暂无真实分钟数据' }}
+          </div>
+        </div>
+
+        <!-- 模拟交易入口 (常驻下单面板, 不绑定当前标的; 面板内含代码/名称搜索) -->
+        <div v-if="!selectedStock.isBoard" class="kline-trade">
+          <trade-order-box :active="activeTab === 'kline'"
+                           title="行情 · 模拟交易"
+                           :code="selectedStock?.code || ''"></trade-order-box>
+        </div>
+      </div>
+      <div v-else class="empty-hint">← 从左侧搜索或点选股票</div>
+    </section>
+
+    <!-- ===== 账户管理已下沉为「设置」模块子模块 (见页面底部设置面板) ===== -->
+
+    <!-- ===== 模拟交易 Tab ===== -->
+    <section v-show="activeTab === 'live'" class="pane no-pad">
+      <live-pane :active="activeTab === 'live'"></live-pane>
+    </section>
+
+    <!-- ===== 训练 Tab ===== -->
+    <section v-show="activeTab === 'train'" class="pane no-pad">
+      <train-pane :active="activeTab === 'train'"></train-pane>
+    </section>
+
+    <!-- ===== 复盘 Tab ===== -->
+    <section v-show="activeTab === 'review'" class="pane no-pad">
+      <review-pane :active="activeTab === 'review'"></review-pane>
+    </section>
+
+  </main>
+  </div><!-- /.app-body -->
+
+  <!-- ============ 动态分组 规则配置弹层 (多条件 AND) ============ -->
+  <div class="dyn-modal" v-if="dynEditorOpen" @click.self="dynEditorOpen = false">
+    <div class="dyn-dialog">
+      <div class="dyn-title">
+        {{ dynEditId ? '编辑动态分组' : '新建动态分组' }}
+        <span v-if="dynEditBuiltin" class="dyn-preset">内置预设 · 只读</span>
+      </div>
+      <input v-model="dynName" class="auth-input" placeholder="分组名称 (如: 强势涨停 / 长上影)"
+             :disabled="dynEditBuiltin">
+      <div class="dyn-hint">多条条件之间为「且 (AND)」关系：全部满足的个股才会被收入该分组；每次打开分组实时按最新行情重新获取。</div>
+      <div v-for="(c, i) in dynConds" :key="i" class="dyn-cond">
+        <select v-model="c.metric" @change="onMetricChange(c)" :disabled="dynEditBuiltin">
+          <option v-for="mt in dynMetrics" :key="mt.key" :value="mt.key">{{ mt.label }}</option>
+        </select>
+        <select v-model="c.op" :disabled="dynEditBuiltin">
+          <option v-for="o in dynOpsOf(c.metric)" :key="o" :value="o">{{ opLabel(o) }}</option>
+        </select>
+        <template v-if="c.op === 'between'">
+          <input type="number" class="dyn-val" v-model.number="c.value1" :disabled="dynEditBuiltin">
+          <span class="dyn-unit">~</span>
+          <input type="number" class="dyn-val" v-model.number="c.value2" :disabled="dynEditBuiltin">
+        </template>
+        <template v-else-if="dynIsBool(c.metric)">
+          <select v-model="c.boolVal" :disabled="dynEditBuiltin">
+            <option :value="true">是</option>
+            <option :value="false">否</option>
+          </select>
+        </template>
+        <template v-else>
+          <input type="number" class="dyn-val" v-model.number="c.value" :disabled="dynEditBuiltin">
+        </template>
+        <span class="dyn-unit">{{ dynUnit(c.metric) }}</span>
+        <button class="btn mini danger" :disabled="dynConds.length <= 1 || dynEditBuiltin"
+                @click="removeDynCond(i)">✕</button>
+      </div>
+      <button class="btn mini" :disabled="dynEditBuiltin" @click="addDynCond">＋ 添加条件</button>
+      <div class="dyn-foot">
+        <span class="dyn-preview">{{ dynPreviewMsg }}</span>
+        <button class="btn mini" :disabled="dynLoading" @click="previewDyn">预览命中</button>
+        <button class="btn mini" @click="dynEditorOpen = false">取消</button>
+        <button class="btn mini primary" :disabled="dynSaving || dynEditBuiltin" @click="saveDyn">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 设置模块 (右上角齿轮聚合: 账密登录 / 页面样式 / 关于) ============ -->
+  <div class="settings-mask" v-if="settingsOpen" @click="settingsOpen = false"></div>
+  <div class="settings-panel" v-if="settingsOpen">
+    <div class="settings-head">
+      <span>⚙ 设置</span>
+      <button class="btn mini" @click="settingsOpen = false">✕</button>
+    </div>
+    <div class="settings-tabs">
+      <span :class="['settings-tab', {active: settingsTab === 'account'}]" @click="settingsTab = 'account'">账号密码</span>
+      <span :class="['settings-tab', {active: settingsTab === 'style'}]" @click="settingsTab = 'style'">页面样式</span>
+      <span :class="['settings-tab', {active: settingsTab === 'about'}]" @click="settingsTab = 'about'">关于</span>
+    </div>
+    <div class="settings-body">
+      <!-- 子模块1: 账号密码登录 (由原「账户」Tab 下沉) -->
+      <div v-show="settingsTab === 'account'">
+        <div class="auth-box">
+          <template v-if="!user">
+            <div class="auth-tabs">
+              <span :class="['auth-tab', { active: authMode === 'login' }]" @click="authMode='login'">登录</span>
+              <span :class="['auth-tab', { active: authMode === 'register' }]" @click="authMode='register'">注册</span>
+            </div>
+            <div class="auth-form">
+              <input v-model="authUser" placeholder="用户名 (至少2位)" class="auth-input">
+              <div class="auth-pass-wrap">
+                <input v-model="authPass" :type="authShowPass ? 'text' : 'password'"
+                       placeholder="密码 (至少6位)" class="auth-input" @keyup.enter="authSubmit">
+                <button type="button" class="auth-eye" :title="authShowPass ? '隐藏密码' : '显示密码'"
+                        @click="authShowPass = !authShowPass">{{ authShowPass ? '🙈' : '👁' }}</button>
+              </div>
+              <template v-if="authMode === 'register'">
+                <input v-model="authPhone" placeholder="手机号 (必填, 11位)" class="auth-input" maxlength="11" @keyup.enter="authSubmit">
+                <input v-model="authEmail" placeholder="邮箱 (选填)" class="auth-input" @keyup.enter="authSubmit">
+              </template>
+              <button class="btn primary" :disabled="authLoading" @click="authSubmit">
+                {{ authLoading ? '处理中...' : (authMode === 'login' ? '登 录' : '注 册') }}
+              </button>
+            </div>
+            <div v-if="authMsg" class="auth-msg">{{ authMsg }}</div>
+          </template>
+          <template v-else-if="needBindPhone">
+            <div class="auth-info">
+              <span class="auth-user">📱 补绑手机号</span>
+              <span class="auth-hint">该账号尚未绑定手机号，请补绑后继续使用</span>
+            </div>
+            <div class="auth-form">
+              <input v-model="authPhone" placeholder="手机号 (必填, 11位)" class="auth-input" maxlength="11" @keyup.enter="submitBindPhone">
+              <input v-model="authEmail" placeholder="邮箱 (选填)" class="auth-input" @keyup.enter="submitBindPhone">
+              <button class="btn primary" :disabled="bindPhoneSubmitting" @click="submitBindPhone">
+                {{ bindPhoneSubmitting ? '提交中...' : '绑 定' }}
+              </button>
+              <button class="btn mini" @click="logout">退出登录</button>
+            </div>
+            <div v-if="authMsg" class="auth-msg">{{ authMsg }}</div>
+          </template>
+          <template v-else>
+            <div class="auth-info">
+              <span class="auth-user">👤 {{ user.username }}</span>
+              <span class="auth-hint">📱 {{ user.phone || '未绑定' }}{{ user.email ? ' · ' + user.email : '' }}</span>
+              <button class="btn mini" @click="logout">退出登录</button>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- 子模块2: 页面样式 (黑 / 白, 参考同花顺) -->
+      <div v-show="settingsTab === 'style'">
+        <div class="settings-sec-title">页面整体风格</div>
+        <div class="theme-cards">
+          <div :class="['theme-card', {active: theme === 'dark'}]" @click="setTheme('dark')">
+            <div class="theme-swatch dark"></div>黑色 (默认)
+          </div>
+          <div :class="['theme-card', {active: theme === 'light'}]" @click="setTheme('light')">
+            <div class="theme-swatch light"></div>白色 (同花顺)
+          </div>
+        </div>
+      </div>
+
+      <!-- 子模块3: 关于 -->
+      <div v-show="settingsTab === 'about'">
+        <div class="about-row">
+          历史回放交易系统<br>
+          版本 v1.0.0 · 优化101103<br>
+          数据源: 新浪财经 (日K / 全市场快照) · akshare<br>
+          页面样式: 黑色 / 白色 双风格
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="indicators.js?v=40"></script>
+<script src="live.js?v=40"></script>
+<script src="train.js?v=40"></script>
+<script src="review.js?v=40"></script>
+<script src="app.js?v=40"></script>
+</body>
+</html>
