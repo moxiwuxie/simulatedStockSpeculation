@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>历史回放交易系统</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="style.css?v=70">
+<link rel="stylesheet" href="style.css?v=71">
 <!-- Vue 3 global build (包含 template compiler) -->
-<script src="vendor/vue.global.js?v=70"></script>
+<script src="vendor/vue.global.js?v=71"></script>
 <!-- ECharts -->
-<script src="vendor/echarts.min.js?v=70"></script>
+<script src="vendor/echarts.min.js?v=71"></script>
 </head>
 <body>
 
@@ -17,10 +17,12 @@
   <!-- ============ 顶部 Tab 栏 (账户为右上角圆形入口) ============ -->
   <nav class="tab-bar">
     <div class="tab-group">
+      <!-- 需求101801-1: 关键功能入口「?」悬浮提示 -->
       <div v-for="tab in tabs" :key="tab.id"
            :class="['tab', tab.cls, {active: activeTab === tab.id}]"
            @click="switchTab(tab.id)">
         {{ tab.icon }} {{ tab.label }}
+        <span class="help-q" :data-tip="tab.tip" @click.stop>?</span>
       </div>
     </div>
     <div class="tab-spacer"></div>
@@ -346,6 +348,7 @@
     <div class="settings-tabs">
       <span :class="['settings-tab', {active: settingsTab === 'account'}]" @click="settingsTab = 'account'">账号密码</span>
       <span :class="['settings-tab', {active: settingsTab === 'style'}]" @click="settingsTab = 'style'">页面样式</span>
+      <span :class="['settings-tab', {active: settingsTab === 'manual'}]" @click="settingsTab = 'manual'">操作手册</span>
       <span :class="['settings-tab', {active: settingsTab === 'about'}]" @click="settingsTab = 'about'">关于</span>
     </div>
     <div class="settings-body">
@@ -413,13 +416,41 @@
         </div>
       </div>
 
-      <!-- 子模块3: 关于 -->
+      <!-- 子模块3: 操作手册 (需求101801-2 · 文档集形式) -->
+      <div v-show="settingsTab === 'manual'">
+        <div class="manual-docbar">
+          <span v-for="d in manualDocs" :key="d.id"
+                :class="['manual-doc', {active: manualDocId === d.id}]"
+                @click="manualDocId = d.id">{{ d.icon }} {{ d.title }}</span>
+        </div>
+        <div class="manual-head">
+          <div class="manual-title">{{ manualDoc.icon }} {{ manualDoc.title }}</div>
+          <div class="manual-sub">{{ manualDoc.desc }}</div>
+        </div>
+        <div class="manual-sec" v-for="(sec, si) in manualDoc.sections" :key="si">
+          <div class="manual-h">{{ sec.h }}</div>
+          <ul class="manual-ul">
+            <li v-for="(it, ii) in sec.items" :key="ii">{{ it }}</li>
+          </ul>
+        </div>
+        <div class="manual-actions">
+          <button class="btn mini primary" @click="maybeOnboard(true)">🧭 重看首次引导</button>
+          <span class="help-q" data-tip="手册按功能拆分为多个文档, 点击上方文档名切换; 引导可随时重看">?</span>
+        </div>
+      </div>
+
+      <!-- 子模块4: 关于 -->
       <div v-show="settingsTab === 'about'">
         <div class="about-row">
           历史回放交易系统<br>
-          版本 v1.0.0 · 优化101103<br>
-          数据源: 新浪财经 (日K / 全市场快照) · akshare<br>
-          页面样式: 黑色 / 白色 双风格
+          版本 v1.0.0 · 优化101801<br>
+          数据源: 新浪财经 (日K / 全市场快照) · akshare · 同花顺 iFinD<br>
+          页面样式: 黑色 / 白色 双风格<br>
+          帮助: 右上角 ⚙ → 操作手册 · 首次登录自动引导
+        </div>
+        <div class="manual-actions">
+          <button class="btn mini" @click="settingsTab = 'manual'">📖 打开操作手册</button>
+          <button class="btn mini" @click="maybeOnboard(true)">🧭 重看首次引导</button>
         </div>
       </div>
     </div>
@@ -533,14 +564,40 @@
       </div>
     </div>
   </div>
+
+  <!-- ============ 需求101801-0: 首次登录引导 (核心流程: 训练 / 模拟交易 / 自选图表 / 看盘复盘) ============ -->
+  <div v-if="onboardOpen" class="onboard-mask" @click.self="closeOnboard(false)">
+    <div class="onboard-panel">
+      <div class="onboard-head">
+        <span>🧭 首次使用引导</span>
+        <span class="onboard-step">{{ onboardStep + 1 }} / {{ onboardSteps.length }}</span>
+      </div>
+      <div class="onboard-body">
+        <div class="onboard-ico">{{ onboardSteps[onboardStep].icon }}</div>
+        <div class="onboard-t">{{ onboardSteps[onboardStep].title }}</div>
+        <div class="onboard-d">{{ onboardSteps[onboardStep].desc }}</div>
+        <div class="onboard-dots">
+          <span v-for="(s, i) in onboardSteps" :key="i"
+                :class="['dot', { on: i === onboardStep }]" @click="onboardGo(i)"></span>
+        </div>
+      </div>
+      <div class="onboard-foot">
+        <button class="btn mini ghost" @click="closeOnboard(false)">稍后</button>
+        <span class="spacer"></span>
+        <button v-if="onboardStep > 0" class="btn mini ghost" @click="onboardGo(onboardStep - 1)">上一步</button>
+        <button v-if="onboardStep < onboardSteps.length - 1" class="btn mini primary" @click="onboardGo(onboardStep + 1)">下一步</button>
+        <button v-else class="btn mini primary" @click="onboardGoTab(onboardSteps[onboardStep].tab)">去体验</button>
+      </div>
+    </div>
+  </div>
 </div>
 
-<script src="preload.js?v=70"></script>
-<script src="indicators.js?v=70"></script>
-<script src="live.js?v=70"></script>
-<script src="train.js?v=70"></script>
-<script src="review.js?v=70"></script>
-<script src="watch.js?v=70"></script>
-<script src="app.js?v=70"></script>
+<script src="preload.js?v=71"></script>
+<script src="indicators.js?v=71"></script>
+<script src="live.js?v=71"></script>
+<script src="train.js?v=71"></script>
+<script src="review.js?v=71"></script>
+<script src="watch.js?v=71"></script>
+<script src="app.js?v=71"></script>
 </body>
 </html>

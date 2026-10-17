@@ -110,13 +110,20 @@ const app = createApp({
     // 不指定 template —— Vue full build 会自动用 mount 目标 (#app) 的 innerHTML 作为模板
     setup() {
         // ---------- 响应式状态 ----------
+        // 需求101801-1: tip = 入口「?」悬浮提示文案
         const tabs = [
-            { id: 'train', label: '训练', icon: '🎯', cls: 'train' },
-            { id: 'live', label: '模拟交易', icon: '💹', cls: 'live' },
-            { id: 'kline', label: '自选', icon: '⭐', cls: 'kline' },
-            { id: 'chart', label: '图表', icon: '📈', cls: 'kline' },
-            { id: 'watch', label: '看盘', icon: '📡', cls: '' },
-            { id: 'review', label: '复盘', icon: '📊', cls: '' },
+            { id: 'train', label: '训练', icon: '🎯', cls: 'train',
+              tip: '零风险盘感训练：逐根 K 线推进，每根做【买入/卖出/观望】决策，结束自动结算并于复盘揭晓标的与盈亏。' },
+            { id: 'live', label: '模拟交易', icon: '💹', cls: 'live',
+              tip: '模拟交易：用真实行情做零资金风险的下单演练，含持仓 / 委托 / 成交流水与盈亏统计。' },
+            { id: 'kline', label: '自选', icon: '⭐', cls: 'kline',
+              tip: '自选：分组管理关注的个股 / 板块 / 指数，单击选中、双击看详情；支持动态分组按指标实时筛选。' },
+            { id: 'chart', label: '图表', icon: '📈', cls: 'kline',
+              tip: '图表：K 线 + 分时 + 指标叠加，可切换周期，左侧抽屉切换分组个股。' },
+            { id: 'watch', label: '看盘', icon: '📡', cls: '',
+              tip: '看盘：全市场快照与板块 / 指数全景，快速发现当日强弱方向。' },
+            { id: 'review', label: '复盘', icon: '📊', cls: '',
+              tip: '复盘：训练与模拟交易的成绩统计、成长曲线与历史记录回顾。' },
         ];
         const activeTab = ref('kline');
 
@@ -243,8 +250,130 @@ const app = createApp({
 
         // ---------- 设置模块 / 主题 ----------
         const settingsOpen = ref(false);
-        const settingsTab = ref('account');    // account | style | about
+        const settingsTab = ref('account');    // account | style | manual | about
         const theme = ref(localStorage.getItem('theme') || 'dark');
+
+        // ---------- 需求101801-0: 首次登录引导 ----------
+        const onboardOpen = ref(false);
+        const onboardStep = ref(0);
+        const onboardSteps = [
+            { icon: '🎯', title: '训练 · 零风险盘感训练', tab: 'train',
+              desc: '从「训练」进入：选品类(股票双盲/长周期) → 设根数与标的 → 点「准备开始训练」。逐根 K 线推进，每根做【买入 / 卖出 / 观望】决策，到末尾自动结算；双盲模式训练中隐藏标的与日期，结束后揭晓，成绩可在「复盘」查看。' },
+            { icon: '💹', title: '模拟交易 · 真实行情下单演练', tab: 'live',
+              desc: '从「模拟交易」进入：使用真实行情做零资金风险的买卖委托，账户资金 / 持仓 / 委托 / 成交流水实时更新，盈亏与风控指标一目了然。' },
+            { icon: '⭐', title: '自选与图表 · 盯住你关注的标的', tab: 'kline',
+              desc: '在「自选」中按分组管理个股 / 板块 / 指数(单击选中、双击看详情)，也可用动态分组按指标实时筛选；「图表」中查看 K 线 + 分时 + 指标，支持切换周期。' },
+            { icon: '📡', title: '看盘与复盘 · 复盘你的每一步', tab: 'watch',
+              desc: '「看盘」提供全市场快照与板块 / 指数全景，快速看清当日强弱；「复盘」汇总训练与模拟交易的成绩统计、成长曲线与历史记录。' },
+        ];
+        // 需求101801-2: 操作手册 (文档集)
+        const manualDocId = ref('quickstart');
+        const manualDocs = [
+            { id: 'quickstart', icon: '🚀', title: '快速上手', desc: '3 分钟走完核心流程：注册登录 → 训练 → 模拟交易。',
+              sections: [
+                  { h: '① 账号注册与登录', items: [
+                      '点击右上角 ⚙「设置 → 账号密码」，切到「注册」页签。',
+                      '账号格式：4-20 位，以字母开头，仅含字母 / 数字 / 下划线(如 trainee01)。',
+                      '密码复杂度：至少 8 位，且需包含大写字母、小写字母、数字、特殊字符中的至少三类(如 Abcd1234!)。',
+                      '手机号必填且全局唯一，邮箱选填；手机号用于账号识别与查找。',
+                  ]},
+                  { h: '② 训练核心流程', items: [
+                      '进入「训练」模块 → 选择品类 → 设置单局 K 线根数 / 初始资金 / 杠杆。',
+                      '可选填「指定标的」与「起始日期」：留空 = 随机抽取并双盲(隐藏名称与日期)。',
+                      '点击「准备开始训练」，进入后逐根推进，每根做出 买入 / 卖出 / 观望 决策。',
+                      '推进到末尾自动结算，双盲标的在结束时揭晓，可在「复盘」回看。',
+                  ]},
+                  { h: '③ 模拟交易核心流程', items: [
+                      '进入「模拟交易」模块 → 搜索并选择标的 → 输入价格与数量下单。',
+                      '在东财 / 委托 / 持仓 / 成交流水中跟踪状态，账户资金与盈亏实时更新。',
+                      '模拟交易使用真实行情，但资金为虚拟，零风险练手。',
+                  ]},
+              ]},
+            { id: 'train', icon: '🎯', title: '训练模块', desc: '逐根 K 线推进的盘感训练，重点在「决策」而非预测。',
+              sections: [
+                  { h: '品类与参数', items: [
+                      '品类：股票双盲(≤250 根) / 长周期训练(≤1250 根)；不同品类杠杆与涨跌停桶不同。',
+                      '单局 K 线根数：决定一局推进的长度，越长越考验持仓与节奏。',
+                      '初始资金 / 杠杆：影响盈亏幅度与爆仓风险。',
+                  ]},
+                  { h: '决策操作', items: [
+                      '买入 / 卖出：按当前根价格成交，仓位与资金实时结算。',
+                      '观望：跳过分歧、等待更优位置；也可用「条件单」预设触发价。',
+                      '周期可切换(日/周/月等)，切换后按新周期粒度继续推进。',
+                  ]},
+                  { h: '结算与复盘', items: [
+                      '推进到末尾自动结算，生成盈亏、收益率、最大回撤、胜率等指标。',
+                      '双盲模式结束时揭示标的名称、区间与日期。',
+                      '所有记录可在「复盘」模块按品类 / 战法 / 时间筛选回顾。',
+                  ]},
+              ]},
+            { id: 'live', icon: '💹', title: '模拟交易', desc: '真实行情下的零风险下单演练。',
+              sections: [
+                  { h: '下单', items: [
+                      '搜索选择标的，填写价格与数量后提交委托；支持限价 / 市价。',
+                      '委托进入「委托」列表，成交后写入「成交流水」。',
+                  ]},
+                  { h: '账户与持仓', items: [
+                      '账户资金分档(基础 / 进阶 / 专业 / 大户)，可在账户页切换。',
+                      '持仓浮动盈亏、可用资金随行情实时刷新，含佣金 / 印花税 / 过户费。',
+                  ]},
+              ]},
+            { id: 'watch', icon: '📡', title: '自选 · 图表 · 看盘 · 复盘', desc: '行情浏览与账号维度的记录回顾。',
+              sections: [
+                  { h: '自选与图表', items: [
+                      '自选支持分组，单击选中、双击看个股详情；动态分组按指标实时筛选。',
+                      '图表展示 K 线 + 分时 + 指标，可切换周期、叠加指标。',
+                  ]},
+                  { h: '看盘', items: [
+                      '全市场快照与板块 / 指数全景，快速识别当日强弱。',
+                      '点击指数 / 板块 / 个股可跳转到「图表」查看。',
+                  ]},
+                  { h: '复盘', items: [
+                      '按品类 / 战法 / 时间维度统计训练与模拟交易成绩。',
+                      '查看成长曲线、胜率、盈亏分布与历史明细。',
+                  ]},
+              ]},
+            { id: 'faq', icon: '❓', title: '账号与常见问题', desc: '账号规则、帮助入口与常见疑问。',
+              sections: [
+                  { h: '账号与安全', items: [
+                      '账号格式：4-20 位，字母开头，仅字母 / 数字 / 下划线。',
+                      '密码：≥8 位，含大小写 / 数字 / 特殊字符至少三类；登录会话 7 天有效。',
+                      '手机号全局唯一；老账号未绑手机号时需先补绑方可使用。',
+                  ]},
+                  { h: '帮助入口', items: [
+                      '未登录账号首次登录成功后会弹出「首次使用引导」，介绍核心流程。',
+                      '关键功能入口旁有「?」问号，鼠标悬停即可查看该功能的简短说明。',
+                      '本操作手册位于「设置 → 操作手册」，可按文档切换；也可随时点「重看首次引导」。',
+                  ]},
+              ]},
+        ];
+        const manualDoc = computed(() =>
+            manualDocs.find(d => d.id === manualDocId.value) || manualDocs[0]);
+
+        /** 引导展示标记按账号隔离: 同一账号只提示一次 */
+        function onboardKey() {
+            const u = user.value;
+            return 'onboard_done_' + (u && u.user_id ? u.user_id : 'guest');
+        }
+        function maybeOnboard(force) {
+            if (!isLoggedIn.value) return;
+            if (!force && localStorage.getItem(onboardKey())) return;
+            onboardStep.value = 0;
+            onboardOpen.value = true;
+        }
+        function closeOnboard(markDone) {
+            onboardOpen.value = false;
+            if (markDone !== false) { try { localStorage.setItem(onboardKey(), '1'); } catch (e) {} }
+        }
+        function onboardGo(i) {
+            onboardStep.value = Math.max(0, Math.min(i, onboardSteps.length - 1));
+        }
+        /** 「去体验」: 关闭并跳到对应模块 */
+        function onboardGoTab(tab) {
+            closeOnboard(true);
+            settingsOpen.value = false;
+            if (tab) switchTab(tab);
+        }
 
         const selectedStock = ref(null);
         const selectedKlineDate = ref(null);
@@ -371,6 +500,8 @@ const app = createApp({
                 await refreshMe();          // 拉取 /auth/me 补齐 phone/email 与绑定状态(以服务端为准)
                 authMsg.value = authMode.value === 'login' ? '登录成功' : '注册成功';
                 if (!needBindPhone.value) { await loadAccount(); await refreshWatch(); await loadDynGroups(); }
+                maybeOnboard();             // 需求101801-0: 首次登录成功 → 弹出核心流程引导
+                settingsOpen.value = false; // 登录完成即收起设置面板, 让引导完整可见
             } catch (e) {
                 let msg = e.message;
                 try { msg = JSON.parse(e.message).reason || e.message; } catch (err) {}
@@ -2003,6 +2134,7 @@ const app = createApp({
             // 恢复登录态: 拉取 /auth/me 获取手机号绑定状态 (旧账号需补绑)
             // 需求101607: 登录态决定 isLoggedIn, 必须先行; 其余三项相互独立 → 并发发起缩短首屏就绪时间
             await refreshMe();
+            maybeOnboard();          // 需求101801-0: 已登录且未看过引导 → 首次登录展示核心流程
             await Promise.allSettled([
                 refreshWatch(),      // 加载自选分组 (后端持久化, 默认分组「自选」; 未登录返回空)
                 loadDynGroups(),
@@ -2089,6 +2221,9 @@ const app = createApp({
             opLabel, previewDyn, saveDyn,
             // 设置模块 / 页面样式
             settingsOpen, settingsTab, openSettings, theme, setTheme,
+            // 需求101801: 首次登录引导 + 操作手册(文档集)
+            onboardOpen, onboardStep, onboardSteps, onboardGo, onboardGoTab, closeOnboard, maybeOnboard,
+            manualDocs, manualDocId, manualDoc,
             importFile, triggerImport, onImportFile,
             selectedStock, selectedKlineDate, indexList, selectIndex, loadIndexList,
             inWatch, addCurrentToWatch, toggleCurrentWatch,
