@@ -8,23 +8,9 @@
   'use strict';
   const { ref, reactive, computed, nextTick, onMounted, watch } = Vue;
 
-  const API = '/api';   // 前端服务反向代理到后端 (同源)
-  async function api(path, opts) {
-    const headers = { 'Content-Type': 'application/json' };
-    const token = localStorage.getItem('auth_token');
-    if (token) headers['Authorization'] = 'Bearer ' + token;   // 与账户/复盘同一身份, 训练记录归属当前账号
-    const res = await fetch(API + path, {
-      headers,
-      ...(opts || {}),
-    });
-    if (!res.ok) {
-      const t = await res.text();
-      let msg = t;
-      try { msg = JSON.parse(t).detail || t; } catch (e) {}
-      throw new Error(msg || ('HTTP ' + res.status));
-    }
-    const ct = res.headers.get('content-type') || '';
-    return ct.includes('json') ? res.json() : res.text();
+  async function api(path, opts, cfg) {
+    // 需求101602: 统一走预加载/缓存层 (只读GET缓存 + 并发去重), 见 preload.js
+    return window.__apiFetch(path, opts, cfg);
   }
 
   function waitForSize(id, timeout) {
@@ -56,6 +42,10 @@
     if (a >= 1e4) return (n / 1e4).toFixed(2) + '万';
     return Number(n).toLocaleString();
   };
+
+  // 划线统一风格: 同花顺红 + 点状虚线 (直线/射线为点状样式)
+  const ANNO_RED = '#ff3b30';
+  const ANNO_DASH = [3, 3];
 
   // Liang-Barsky 线段裁剪: 将线段裁剪到矩形内 (用于延长线/射线超出绘图区的部分)
   function clipLine(p1, p2, rect) {
@@ -135,8 +125,55 @@
       </div>
 
       <div class="setup-block">
-        <label>指定标的 <span class="hint">留空 = 随机抽取 (双盲)</span></label>
-        <input v-model="form.code" placeholder="如 600519 / sh000001 / AAPL / 00700">
+        <label>指定标的 <span class="hint">留空 = 随机抽取 (双盲) · 支持代码 / 名称 / 拼音</span></label>
+        <div class="code-search">
+          <input v-model="codeKw" placeholder="如 600519 / 贵州茅台 / gzmt" autocomplete="off"
+                 @input="onCodeInput" @focus="onCodeFocus" @keydown.enter.prevent="pickCodeFirst"
+                 @keydown.down.prevent="codeOpen = codeResults.length > 0"
+                 @keydown.esc="closeCodeList">
+          <button v-if="codeKw" class="code-clear" @click="clearCodeKw" title="清空标的">✕</button>
+          <div v-if="codeOpen && codeResults.length" class="tb-suggest">
+            <div v-for="r in codeResults" :key="r.code" class="tb-suggest-item" @click="pickCode(r)">
+              <span class="s-name">{{ r.name }}</span>
+              <span class="s-code">{{ r.code }}</span>
+              <span class="s-pct" :class="r.change_pct > 0 ? 'up' : (r.change_pct < 0 ? 'down' : '')">{{ r.change_pct == null ? '--' : r.change_pct + '%' }}</span>
+            </div>
+          </div>
+        </div>
+        <div v-if="codeLabel" class="code-picked">已选标的：{{ codeLabel }}</div>
+      </div>
+
+      <div class="setup-block">
+        <label>起始日期 <span class="hint">与标的同填 = 非双盲训练 (展示名称与日期)</span></label>
+        <div class="date-field" ref="dateField" @click="toggleCalendar">
+          <span class="df-icon">📅</span>
+          <span class="df-text" :class="{ ph: !form.start_date }">{{ form.start_date || '选择起始交易日' }}</span>
+          <span v-if="form.start_date" class="df-clear" @click.stop="clearDate" title="清空日期">✕</span>
+        </div>
+        <div v-if="availHint" class="avail-hint">{{ availHint }}</div>
+
+        <!-- 日历弹层: position:fixed, 免被 .train-wrap 的 overflow 裁切 -->
+        <div v-if="dateOpen" class="date-pop" :style="datePopStyle">
+          <div class="dp-head">
+            <button class="dp-nav" @click="stepYear(-1)" title="上一年">«</button>
+            <button class="dp-nav" @click="stepMonth(-1)" title="上一月">‹</button>
+            <span class="dp-title">{{ calY }} 年 {{ calM }} 月</span>
+            <button class="dp-nav" @click="stepMonth(1)" title="下一月">›</button>
+            <button class="dp-nav" @click="stepYear(1)" title="下一年">»</button>
+            <button class="dp-close" @click="closeCalendar" title="关闭">✕</button>
+          </div>
+          <div class="dp-quick">
+            <button v-for="q in quickRanges" :key="q.key" class="dp-qbtn" @click="quickPick(q)">{{ q.label }}</button>
+            <button class="dp-qbtn ghost" @click="clearDate">清空</button>
+          </div>
+          <div class="dp-dow"><span v-for="d in dowLabels" :key="d">{{ d }}</span></div>
+          <div class="dp-grid">
+            <span v-for="c in calCells" :key="c.key"
+                  :class="['dp-cell', { muted: !c.inMonth, today: c.isToday, sel: c.isSel, disabled: c.disabled }]"
+                  @click="pickDate(c)">{{ c.day }}</span>
+          </div>
+          <div class="dp-foot"><span class="dp-tip">{{ calTip }}</span></div>
+        </div>
       </div>
 
       <div class="setup-block actions">
@@ -146,7 +183,7 @@
     </div>
 
     <button class="btn primary big" :disabled="loading || !loggedIn" @click="start">
-      {{ loading ? '⏳ 正在准备行情...' : (loggedIn ? '🚀 开始训练' : '🔒 请先登录后再开始训练') }}
+      {{ loading ? '⏳ 正在准备行情...' : (loggedIn ? '🚀 准备开始训练' : '🔒 请先登录后再开始训练') }}
     </button>
     <div v-if="error" class="err-box">{{ error }}</div>
 
@@ -156,6 +193,9 @@
     </div>
   </div>
 
+  <!-- 提示条: 位于配置/运行两态之外, 训练开始后仍可见 (如「本局按 N 根进行」) -->
+  <div v-if="notice" class="notice-box">{{ notice }}</div>
+
   <!-- ============ 训练进行中 ============ -->
   <div class="train-run" v-show="session">
     <!-- 顶栏: 进度 + 账户 -->
@@ -163,10 +203,9 @@
       <div class="blind-head">
         <span class="blind-title">🎯 {{ session && session.category_label }}</span>
         <span class="tag" :class="session && session.status === 'active' ? 'doing' : 'quit'" v-if="session">{{ session.status_label }}</span>
-        <span class="blind-code revealed" v-if="session && session.code_revealed">{{ session.code_name }} {{ session.code }} · {{ session.start_date }} ~ {{ session.end_date }}</span>
+        <span class="blind-code revealed" v-if="session && (session.code_revealed || session.non_blind)">{{ session.code_name }} {{ session.code }} · {{ session.start_date }} ~ {{ session.end_date }}</span>
         <span class="blind-code" v-else-if="session && session.code">🎯 {{ session.code_name }} {{ session.code }}</span>
         <span class="blind-code" v-else-if="session">🔒 标的信息已隐藏</span>
-        <span class="blind-feat" v-if="session">🎚 近期涨停 {{ session.limit_up_count }} 次</span>
       </div>
       <div class="progress-wrap">
         <div class="progress-bar"><div class="progress-fill" :style="{ width: progressPct + '%' }"></div></div>
@@ -185,6 +224,7 @@
       <div class="acct-cell"><span>总资产</span><b>{{ fmt(session.portfolio_value) }}</b></div>
       <div class="acct-cell"><span>可用现金</span><b>{{ fmt(session.cash) }}</b></div>
       <div class="acct-cell"><span>持仓</span><b :class="session.pos > 0 ? 'up' : session.pos < 0 ? 'down' : ''">{{ session.pos }}</b></div>
+      <div class="acct-cell" v-if="session.pos > 0 && session.locked_qty > 0"><span>可卖(T+1)</span><b :class="session.sellable_qty > 0 ? 'up' : 'down'">{{ session.sellable_qty }}</b></div>
       <div class="acct-cell"><span>持仓均价</span><b>{{ session.avg_cost }}</b></div>
       <div class="acct-cell" v-if="session.margin > 0"><span>保证金</span><b>{{ fmt(session.margin) }}</b></div>
       <div class="acct-cell"><span>现价</span><b>{{ session.current_price }}</b></div>
@@ -256,11 +296,16 @@
         </select>
       </div>
       <input class="qty-input" type="number" min="1" v-model.number="qty" placeholder="数量(留空=按仓位)">
-      <button class="btn buy" @click="act('buy')">📈 买入</button>
-      <button class="btn sell" @click="act('sell')">📉 卖出</button>
-      <button class="btn hold" @click="holdAndAdvance">观望</button>
+      <button class="btn buy" :disabled="!canBuy" :title="canBuy ? '' : '可用资金不足 1 手, 无法买入'" @click="act('buy')">📈 买入</button>
+      <button class="btn sell" :disabled="sellLocked" :title="sellLocked ? '当日买入(T+1), 次日开盘后才能卖出' : ''" @click="act('sell')">📉 卖出</button>
+      <button class="btn hold" @click="holdAndAdvance" title="观望 (快捷键 →)">观望</button>
       <button class="btn ghost" @click="advance5">观望 5 个交易日</button>
       <button class="btn ghost" @click="settle">💰 结算</button>
+    </div>
+
+    <!-- 需求4: 买入挂单提示 (次日开盘成交, 缩量一字板将无法买入) -->
+    <div class="pending-tip" v-if="session && session.pending_buy">
+      ⏳ 买入委托已挂出, 将于<b>次日开盘价</b>成交 (若遇缩量一字板则将无法买入)
     </div>
 
     <!-- 条件单: 止盈 / 止损 / 移动止损 (触发即操作) -->
@@ -407,13 +452,199 @@
       function continueDraw() { annoLeft.value = drawCount.value; drawDone.value = false; }
       function clearAnnos() {
         annos.value = []; annoAnchor.value = null; drawDone.value = false;
-        annoLeft.value = drawCount.value; draw(true);
+        annoLeft.value = drawCount.value; syncAnnos(); draw(true);
+      }
+      // 需求3: 划线数据落库, 复盘历史对局同步渲染
+      function syncAnnos() {
+        const s = session.value;
+        if (!s || !s.session_id) return;
+        api('/training/' + s.session_id + '/annos', {
+          method: 'POST', body: JSON.stringify({ annos: annos.value }),
+        }).catch(function () {});
       }
 
       const form = reactive({
         category: 'stock', bars: 250, initial_capital: 1000000,
-        leverage: 1, strategy_id: null, code: '',
+        leverage: 1, strategy_id: null, code: '', start_date: '',
       });
+      const notice = ref('');     // 通用提示 (多条命中 / 窗口按可用量收缩)
+
+      // ===== 起始日期可用区间提示 (与后端 MIN_BARS / 按可用量收缩 对齐) =====
+      const MIN_BARS_HINT = 20;
+      const availHint = ref('');
+      let availKey = '';
+      async function loadAvail() {
+        const code = (codeCode.value || form.code || '').trim();
+        availHint.value = '';
+        if (!code || !form.start_date) { availKey = ''; return; }
+        const key = code + '@' + form.start_date;
+        if (key === availKey) return;
+        try {
+          const bars = (await api('/stocks/' + encodeURIComponent(code) + '/kline?days=2500')) || [];
+          const n = bars.filter(function (b) { return String(b.date).slice(0, 10) >= form.start_date; }).length;
+          if (!n) availHint.value = '⚠ 该日期晚于标的全部 K 线, 请调整起始日期';
+          else if (n < MIN_BARS_HINT) availHint.value = '⚠ 该日期之后仅 ' + n + ' 根 K 线, 不足单局最少 ' + MIN_BARS_HINT + ' 根';
+          else availHint.value = '✓ 该日期之后可用 ' + n + ' 根 K 线 (本局按 ' + Math.min(form.bars, n) + ' 根进行)';
+          availKey = key;
+        } catch (e) { availHint.value = ''; availKey = ''; }
+      }
+
+      // ===== 需求2: 指定标的搜索 (代码 / 名称 / 拼音, 类比行情个股搜索) =====
+      const codeKw = ref('');
+      const codeResults = ref([]);
+      const codeOpen = ref(false);
+      const codeLabel = ref('');
+      const codeCode = ref('');
+      let codeTimer = null;
+      function onCodeInput() {
+        codeCode.value = ''; codeLabel.value = ''; form.code = '';
+        availHint.value = ''; availKey = '';
+        const k = (codeKw.value || '').trim();
+        if (codeTimer) clearTimeout(codeTimer);
+        if (!k) { codeResults.value = []; codeOpen.value = false; return; }
+        codeTimer = setTimeout(async function () {
+          try {
+            codeResults.value = (await api('/stocks/search?keyword=' + encodeURIComponent(k) + '&limit=8')) || [];
+            codeOpen.value = codeResults.value.length > 0;
+          } catch (e) { codeResults.value = []; codeOpen.value = false; }
+        }, 250);
+      }
+      function onCodeFocus() { if (codeResults.value.length) codeOpen.value = true; }
+      function pickCode(r) {
+        if (!r || !r.code) return;
+        codeCode.value = r.code;
+        codeLabel.value = (r.name || '') + ' ' + r.code;
+        codeKw.value = codeLabel.value;
+        form.code = r.code;
+        codeResults.value = []; codeOpen.value = false;
+        loadAvail();
+      }
+      function pickCodeFirst() { if (codeResults.value.length) pickCode(codeResults.value[0]); }
+      function closeCodeList() { codeOpen.value = false; }
+      function clearCodeKw() {
+        codeKw.value = ''; codeCode.value = ''; codeLabel.value = '';
+        codeResults.value = []; codeOpen.value = false; form.code = '';
+        availHint.value = ''; availKey = '';
+      }
+      /** 提交前解析: 纯代码直通(去掉 sh/sz/bj 前缀, 后端只认裸 6 位代码), 文本/拼音走搜索取首条 */
+      async function resolveCodeForSubmit() {
+        const raw = (codeKw.value || '').trim();
+        if (!raw) { form.code = ''; return null; }
+        const m = raw.match(/^(sh|sz|bj)?(\d{4,6})$/i);
+        if (m) { form.code = m[2]; return m[2]; }
+        if (codeCode.value) { form.code = codeCode.value; return codeCode.value; }
+        const rs = (await api('/stocks/search?keyword=' + encodeURIComponent(raw) + '&limit=8')) || [];
+        if (!rs.length) throw new Error('未找到匹配标的「' + raw + '」, 请检查名称 / 代码 / 拼音');
+        form.code = rs[0].code;
+        if (rs.length > 1) {
+          notice.value = '「' + raw + '」命中 ' + rs.length + ' 个标的, 已取首个: ' +
+                         (rs[0].name || '') + ' ' + rs[0].code;
+        }
+        return rs[0].code;
+      }
+
+      // ===== 需求1+4: 自定义日历弹层 (整块热区 / 年月快切 / 快捷范围 / 深浅主题自适应) =====
+      const dateOpen = ref(false);
+      const dateField = ref(null);
+      const datePopStyle = reactive({ left: '0px', top: '0px', width: '290px' });
+      const dowLabels = ['一', '二', '三', '四', '五', '六', '日'];
+      const quickRanges = [
+        { key: 'today', label: '今天' },
+        { key: 'm1', label: '近 1 月' },
+        { key: 'm3', label: '近 3 月' },
+        { key: 'y1', label: '近 1 年' },
+      ];
+      const DATE_MIN = '2015-01-01';       // 有效区间下限 (早于此通常无行情数据)
+      function localDateStr(d) {
+        return d.getFullYear() + '-' +
+               String(d.getMonth() + 1).padStart(2, '0') + '-' +
+               String(d.getDate()).padStart(2, '0');
+      }
+      const todayStr = localDateStr(new Date());
+      const DATE_MAX = todayStr;           // 上限: 今日 (训练基于历史数据回放)
+      const calY = ref(new Date().getFullYear());
+      const calM = ref(new Date().getMonth() + 1);   // 1-12
+      const calCells = computed(function () {
+        const y = calY.value, m = calM.value;
+        const lead = (new Date(y, m - 1, 1).getDay() + 6) % 7;   // 周一为一周起始
+        const daysInMonth = new Date(y, m, 0).getDate();
+        const prevDays = new Date(y, m - 1, 0).getDate();
+        const cells = [];
+        for (let i = 0; i < 42; i++) {
+          const n = i - lead + 1;
+          let yy = y, mm = m, dd = n, inMonth = true;
+          if (n <= 0) { mm = m - 1; if (mm === 0) { mm = 12; yy = y - 1; } dd = prevDays + n; inMonth = false; }
+          else if (n > daysInMonth) { mm = m + 1; if (mm === 13) { mm = 1; yy = y + 1; } dd = n - daysInMonth; inMonth = false; }
+          const v = yy + '-' + String(mm).padStart(2, '0') + '-' + String(dd).padStart(2, '0');
+          cells.push({
+            key: v, day: dd, v: v, inMonth: inMonth,
+            isToday: v === todayStr, isSel: v === form.start_date,
+            disabled: v < DATE_MIN || v > DATE_MAX,
+          });
+        }
+        return cells;
+      });
+      const calTip = computed(function () {
+        return form.start_date
+          ? '已选 ' + form.start_date + ' · 与标的同填即为非双盲训练'
+          : '上限为今日 · 早于 ' + DATE_MIN + ' 的日期无效';
+      });
+      function computePos() {
+        const el = dateField.value;
+        if (!el) return;
+        const r = el.getBoundingClientRect();
+        if (!r.width) return;
+        const vw = window.innerWidth;
+        const w = Math.min(Math.max(290, Math.round(r.width)), vw - 24);
+        datePopStyle.width = w + 'px';
+        datePopStyle.left = Math.max(12, Math.min(Math.round(r.left), vw - w - 12)) + 'px';
+        const need = 340;   // 弹层预估高度
+        const below = window.innerHeight - r.bottom;
+        if (below < need && r.top > below) {
+          datePopStyle.bottom = Math.round(window.innerHeight - r.top + 6) + 'px';
+          datePopStyle.top = 'auto';
+        } else {
+          datePopStyle.top = Math.round(r.bottom + 6) + 'px';
+          datePopStyle.bottom = 'auto';
+        }
+      }
+      function openCalendar() {
+        if (form.start_date) {
+          const p = form.start_date.split('-');
+          calY.value = Number(p[0]); calM.value = Number(p[1]);
+        }
+        dateOpen.value = true;
+        codeOpen.value = false;
+        nextTick(computePos);
+      }
+      function toggleCalendar() { if (dateOpen.value) closeCalendar(); else openCalendar(); }
+      function closeCalendar() { dateOpen.value = false; }
+      function stepMonth(d) {
+        let m = calM.value + d;
+        while (m > 12) { m -= 12; calY.value += 1; }
+        while (m < 1) { m += 12; calY.value -= 1; }
+        calM.value = m;
+      }
+      function stepYear(d) { calY.value += d; }
+      function pickDate(c) {
+        if (!c || c.disabled) return;
+        form.start_date = c.v;
+        dateOpen.value = false;
+        availKey = ''; loadAvail();
+      }
+      function clearDate() {
+        form.start_date = ''; availHint.value = ''; availKey = ''; dateOpen.value = false;
+      }
+      function quickPick(q) {
+        const now = new Date();
+        const d = q.key === 'today' ? now
+                : q.key === 'y1' ? new Date(now.getFullYear() - 1, now.getMonth(), now.getDate())
+                : new Date(now.getFullYear(), now.getMonth() - (q.key === 'm1' ? 1 : 3), now.getDate());
+        let v = localDateStr(d);
+        if (v > DATE_MAX) v = DATE_MAX;
+        if (v < DATE_MIN) v = DATE_MIN;
+        pickDate({ v: v, disabled: false });
+      }
 
       let chart = null;
       let intradayChart = null;
@@ -431,6 +662,20 @@
       const pnlClass = computed(function () {
         const p = session.value ? session.value.pnl : 0;
         return p > 0 ? 'up' : p < 0 ? 'down' : '';
+      });
+      // 满仓后可用资金不足 1 手 → 禁止买入 (与后端资金校验一致, 避免"满仓还能再买")
+      // 已有待成交委托时同样禁用 (次日开盘才会成交, 避免重复挂单)
+      const canBuy = computed(function () {
+        const s = session.value;
+        if (!s || s.status !== 'active') return false;
+        if (s.pending_buy) return false;
+        const price = s.current_price || 0;
+        return price > 0 && (s.cash || 0) >= price * 100;
+      });
+      // T+1: 当日买入的持仓不可卖出 → 无可卖数量时禁用卖出按钮
+      const sellLocked = computed(function () {
+        const s = session.value;
+        return !!(s && s.status === 'active' && s.pos > 0 && (s.sellable_qty || 0) <= 0);
       });
 
       // 单局 K 线根数上限: 由后端品类元数据驱动 (股票双盲 250 / 长周期训练 1250)
@@ -452,20 +697,24 @@
         form.bars = Math.min(Math.max(def, 20), cap);
       }
 
-      async function loadCategories() {
+      async function loadCategories(force) {
         try {
-          categories.value = (await api('/training/categories')).categories;
+          // 需求101701-2: 强制绕过浏览器 HTTP 缓存 (移动端曾缓存旧品类列表而看不到「长周期训练」);
+          // force=true 时同时清前端内存缓存, 保证每次进入训练模块都拿到最新品类。
+          if (force) { window.__apiCacheClear('/training/categories'); }
+          categories.value = (await api('/training/categories', { method: 'GET' },
+                                       { httpNoStore: true })).categories;
         } catch (e) { console.error('加载品类失败', e.message); }
       }
+      // 归属战法默认「默认」(未归类 = null): 后端不再自动创建/绑定「副本」,
+      // 界面也不应凭空出现用户没建过的战法
       function defaultStrategyId() {
-        const d = strategies.value.find(function (s) { return s.name === '副本'; });
-        return d ? d.id : null;
+        return null;
       }
       async function loadStrategies(selectDefault) {
         try {
           strategies.value = (await api('/strategies')).strategies;
-          // 归属战法默认选「副本」战法 (仅首次/恢复默认时)
-          if (selectDefault || form.strategy_id == null) form.strategy_id = defaultStrategyId();
+          if (selectDefault) form.strategy_id = defaultStrategyId();
         } catch (e) { console.error('加载战法失败', e.message); }
       }
       async function addStrategy() {
@@ -499,7 +748,8 @@
         }).then(function (el) {
           if (!el) return null;
           if (chart) { chart.dispose(); chart = null; }
-          chart = echarts.init(el);
+          // 需求101604: useDirtyRect 只重绘变化区域, 推进/切周期/加自选等重绘更快
+          chart = echarts.init(el, null, { useDirtyRect: true });
           return chart;
         });
       }
@@ -519,6 +769,26 @@
           });
       }
 
+      // 需求101701: 分时 URL 携带版本令牌 —— 令牌与「内容」一一对应,
+      // 使同一 URL 的内容恒定, 从而让只读分时可被前端预加载层长缓存:
+      //   · 背景K线: 内容只随 (周期 + 揭晓态) 变化 → 令牌稳定
+      //   · 已完成周期桶: 内容只随 (周期 + 揭晓态) 变化 → 令牌稳定, 历史K线分时可长期命中缓存
+      //   · 当前正在形成的周期桶: OHLC 随已推进交易日数变化 → 令牌含 days_used, 保证始终新鲜
+      function intradayUrl(kind, idx) {
+        const s = session.value;
+        if (!s) return '';
+        const rev = s.code_revealed ? 1 : 0;
+        const sid = s.session_id;
+        if (kind === 'pre') {
+          return '/training/session/' + sid + '/pre-intraday?idx=' + idx + '&v=' + [s.period, rev].join('-');
+        }
+        const isPartial = idx >= s.bars_used;
+        const v = isPartial
+          ? [s.period, 'p', s.days_used, rev].join('-')
+          : [s.period, rev].join('-');
+        return '/training/session/' + sid + '/bar-intraday?idx=' + idx + '&v=' + v;
+      }
+
       // 统一加载分时: mergedIdx 主图合并索引 (<preN=前置背景, >=preN=训练K线)
       async function loadIntraday(mergedIdx) {
         const s = session.value;
@@ -527,15 +797,15 @@
         let d = null, zone = '';
         try {
           if (mergedIdx < preN) {
-            let pi = Math.max(0, Math.min(mergedIdx, preN - 1));
-            d = await api('/training/session/' + s.session_id + '/pre-intraday?idx=' + pi);
+            const pi = Math.max(0, Math.min(mergedIdx, preN - 1));
+            d = await api(intradayUrl('pre', pi));
             zone = '📒背景';
           } else {
             const n = (s.bars || []).length;
             let bi = mergedIdx - preN;
             if (bi > n - 1) bi = n - 1;   // 容错: 索引越界收敛到末根, 避免 400
             if (bi < 0) bi = 0;
-            d = await api('/training/session/' + s.session_id + '/bar-intraday?idx=' + bi);
+            d = await api(intradayUrl('bar', bi));
             zone = '🎯训练';
           }
         } catch (e) { console.error('分时失败:', e.message); return; }
@@ -552,6 +822,8 @@
       async function showCurrentIntraday() {
         const s = session.value;
         if (!s) return;
+        // 周/月/年线首桶未走完时训练段无可见K线 → 无对应分时可加载
+        if (!(s.bars || []).length) return;
         let ci = s.bars_used;
         if (ci >= s.bars_total) ci = s.bars_total - 1;
         if (ci < 0) return;
@@ -644,36 +916,76 @@
       }
 
       function resetForm() {
-        Object.assign(form, { category: 'stock', bars: 250, initial_capital: 1000000, leverage: 1, code: '' });
+        Object.assign(form, { category: 'stock', bars: 250, initial_capital: 1000000, leverage: 1, code: '', start_date: '' });
         form.strategy_id = defaultStrategyId();
+        codeKw.value = ''; codeCode.value = ''; codeLabel.value = ''; codeResults.value = []; codeOpen.value = false;
+        availHint.value = ''; availKey = ''; dateOpen.value = false; notice.value = '';
         resetMa();
       }
-      function clearCode() { form.code = ''; }
+      function clearCode() {
+        form.code = ''; form.start_date = '';
+        codeKw.value = ''; codeCode.value = ''; codeLabel.value = ''; codeResults.value = []; codeOpen.value = false;
+        availHint.value = ''; availKey = ''; dateOpen.value = false;
+      }
+
+      // 需求101604: 开局请求体 (start / prime 必须构造完全一致, 后端靠参数指纹复用预生成数据)
+      function startBody() {
+        return {
+          category: form.category, bars: form.bars,
+          initial_capital: form.initial_capital,
+          leverage: form.leverage,
+          strategy_id: form.strategy_id || null,
+          code: (form.code || '').trim() || null,
+          start_date: (form.start_date || '').trim() || null,
+        };
+      }
+
+      // 需求101604: 预生成 —— 进入训练页 / 改参数 400ms 后, 提前把本局数据备好
+      let primeTimer = null, primeSeq = 0;
+      async function prime() {
+        if (session.value) return;                 // 局中不预生成
+        refreshLogin();
+        if (!loggedIn.value) return;
+        const seq = ++primeSeq;
+        try {
+          await resolveCodeForSubmit();
+          if (seq !== primeSeq) return;            // 参数又变了 → 丢弃过期请求
+          await api('/training/prime', { method: 'POST', body: JSON.stringify(startBody()) });
+        } catch (e) { /* 预生成失败不影响正常开局 (start 会现场构建) */ }
+      }
+      function schedulePrime() {
+        if (primeTimer) clearTimeout(primeTimer);
+        primeTimer = setTimeout(function () { primeTimer = null; prime(); }, 400);
+      }
 
       async function start() {
         refreshLogin();
         if (!loggedIn.value) { error.value = '请先登录后再开始训练'; return; }
-        loading.value = true; error.value = '';
+        loading.value = true; error.value = ''; notice.value = '';
         try {
-          const body = {
-            category: form.category, bars: form.bars,
-            initial_capital: form.initial_capital,
-            leverage: form.leverage,
-            strategy_id: form.strategy_id || null,
-            code: (form.code || '').trim() || null,
-          };
-          const res = await api('/training/start', { method: 'POST', body: JSON.stringify(body) });
+          await resolveCodeForSubmit();   // 需求2: 代码/名称/拼音 → 归一化标的代码
+          const res = await api('/training/start', { method: 'POST', body: JSON.stringify(startBody()) });
           marks.value = [];
           note.value = ''; savedMsg.value = '';
           qty.value = null;
           condPrice.value = null; condTrail.value = null; condKind.value = 'take_profit'; condRatio.value = 1;
+          annos.value = []; annoAnchor.value = null; drawMode.value = 'select'; drawDone.value = false;
           session.value = res;
+          // 需求3: 起始日期贴近数据末端时后端会按可用量收缩窗口 → 明确告知实际根数
+          if (res.non_blind && res.bars_total < form.bars) {
+            notice.value = '本局按 ' + res.bars_total + ' 根 K 线进行 (' + res.start_date + ' ~ ' + res.end_date + ')';
+          }
           // 市场背景: 训练窗口之前的历史K线 (与训练K线合并连续绘制)
           preBars.value = res.pre_bars || [];
           preAmp.value = null; preDate.value = '';
+          loading.value = false;             // 需求101604: API 已返回, 立即解除「开始中」遮罩
           await ensureChart();
-          draw();
-          showCurrentIntraday();
+          draw(false, true);                 // 需求101604: 首帧只画 K线+成交量 → 主图立即可见
+          // 下一帧补齐 MA/MACD/买卖点/画线, 并异步加载右侧分时 (不阻塞首屏)
+          requestAnimationFrame(function () {
+            draw(false, false);
+            showCurrentIntraday();
+          });
         } catch (e) {
           error.value = '❌ ' + e.message;
         } finally {
@@ -688,18 +1000,35 @@
           const body = { qty: qty.value || null, ratio: kind === 'buy' ? (positionRatio.value || null) : null };
           const before = session.value.bars_used;
           const res = await api('/training/' + sid + '/' + kind, { method: 'POST', body: JSON.stringify(body) });
-          if (kind === 'buy' || kind === 'sell') {
+          if (kind === 'sell') {
             const b = session.value.bars[before];
-            // 按「训练K线日期」记录买卖点: 切换周期(日/周/月/年)后可用日期重新定位, 不会丢点
+            // 卖出 = 当日收盘即时成交 → 立即记录卖点
             marks.value.push({
-              index: before, date: b ? b.date : null, action: kind.toUpperCase(),
-              price: res.current_price,
+              index: before, date: b ? b.date : null, action: 'SELL', price: res.current_price,
             });
+          } else if (kind === 'buy') {
+            // 需求4: 买入为挂单, 于次日开盘成交 → 成交时(pending_filled)再补买点
+            error.value = '⏳ 买入委托已挂出, 将于次日开盘成交';
           }
           session.value = res;
+          const p = showCurrentIntraday();   // 需求101701: 分时请求与 K线绘制并行
           draw();
-          showCurrentIntraday();
+          await p;
         } catch (e) { error.value = e.message; }
+      }
+
+      // 需求4: 推进后按成交回报补买点 / 提示买不到
+      function applyFill(res) {
+        const pf = res && res.pending_filled;
+        if (!pf) return;
+        if (pf.action === 'BUY' || pf.action === 'COVER') {
+          marks.value.push({
+            index: pf.bar_index, date: pf.date,
+            action: pf.action === 'COVER' ? 'COVER' : 'BUY', price: pf.price,
+          });
+        } else if (pf.action === 'BUY_FAILED') {
+          error.value = '⚠️ ' + (pf.reason || '无法买入');
+        }
       }
 
       // 挂止盈/止损/移动止损条件单 (不要求先有持仓: 触发即尝试操作, 无可操作持仓则提示)
@@ -746,20 +1075,29 @@
       async function doAdvance() {
         if (!session.value) return;
         try {
+          error.value = '';
           const res = await api('/training/' + session.value.session_id + '/advance', { method: 'POST', body: '{}' });
           session.value = res.session;
+          applyFill(res);
           noteSkipped(res);
+          const p = showCurrentIntraday();   // 需求101701: 分时请求与 K线绘制并行, 缩短等待
           draw();
-          showCurrentIntraday();
+          await p;
         } catch (e) { error.value = e.message; }
       }
 
-      // 观望 = hold + advance 一步完成 (决策后直接推进到下一根K线)
+      // 观望 = hold + advance 一步完成 (需求101701: 合并为单次请求, 后端只落库一次)
       async function holdAndAdvance() {
         if (!session.value) return;
         try {
-          session.value = await api('/training/' + session.value.session_id + '/hold', { method: 'POST', body: '{}' });
-          await doAdvance();
+          error.value = '';
+          const res = await api('/training/' + session.value.session_id + '/hold?advance=1', { method: 'POST', body: '{}' });
+          session.value = res.session;
+          applyFill(res);
+          noteSkipped(res);
+          const p = showCurrentIntraday();
+          draw();
+          await p;
         } catch (e) { error.value = e.message; }
       }
 
@@ -767,11 +1105,14 @@
       async function advance5() {
         if (!session.value) return;
         try {
+          error.value = '';
           const res = await api('/training/' + session.value.session_id + '/advance?steps=5', { method: 'POST', body: '{}' });
           session.value = res.session;
+          applyFill(res);
           noteSkipped(res);
+          const p = showCurrentIntraday();
           draw();
-          showCurrentIntraday();
+          await p;
         } catch (e) { error.value = e.message; }
       }
 
@@ -783,9 +1124,11 @@
           session.value = await api('/training/' + s.session_id + '/period', { method: 'POST', body: JSON.stringify({ period: period }) });
           // 周期变化后画线索引失效需清空; 买卖点按日期重定位, 予以保留
           annos.value = []; annoAnchor.value = null;
+          syncAnnos();
           preBars.value = session.value.pre_bars || [];
+          const p = showCurrentIntraday();
           draw();
-          showCurrentIntraday();
+          await p;
         } catch (e) { error.value = e.message; }
       }
 
@@ -793,8 +1136,9 @@
         if (!session.value) return;
         try {
           session.value = await api('/training/' + session.value.session_id + '/settle', { method: 'POST', body: '{}' });
+          const p = showCurrentIntraday();
           draw();
-          showCurrentIntraday();
+          await p;
         } catch (e) { error.value = e.message; }
       }
 
@@ -806,6 +1150,7 @@
         preAmp.value = null; preDate.value = '';
         disposePre();
         if (chart) { chart.dispose(); chart = null; }
+        schedulePrime();          // 需求101604: 回到设置面板 → 提前预生成下一局数据
       }
 
       async function saveStrategy() {
@@ -834,12 +1179,14 @@
       const VIEW_WIN = 80;
 
       // ---------- 绘图 ----------
-      function draw(keepZoom) {
+      // lite=true 只画「K线+成交量」关键帧 (需求101604: 首屏先出主图, MA/MACD/标记下一帧补齐)
+      function draw(keepZoom, lite) {
         const s = session.value;
         if (!chart || !s) return;
         const pre = preBars.value || [];
         const bars = s.bars || [];
-        if (!bars.length) return;
+        // 周/月/年线在「尚未走完第一个周期桶」时训练段为空, 仍需绘制市场背景 (不能整体 return)
+        if (!pre.length && !bars.length) return;
         const revealed = !!s.code_revealed;
         const preN = pre.length;         // 前置段根数 (训练起点偏移)
         // 连成一条序列: 前置K线 + 已可见训练K线, 双盲时横轴连续编号
@@ -876,7 +1223,7 @@
         } else if (window.Indicators && window.Indicators.macd) {
           macdM = window.Indicators.macd(all);   // 兼容回退 (旧会话无 macd 字段)
         }
-        if (macdM) {
+        if (macdM && !lite) {
           const m = macdM;
           series.push(
             { name: 'DIF', type: 'line', data: m.dif, xAxisIndex: 2, yAxisIndex: 2, showSymbol: false, smooth: true,
@@ -890,7 +1237,7 @@
         }
 
         // MA 均线 (重叠加在主K线图, 数据不足时 null 自动跳过)
-        if (window.Indicators && window.Indicators.sma && maOn.value.length) {
+        if (!lite && window.Indicators && window.Indicators.sma && maOn.value.length) {
           const closes = all.map(function (b) { return b.close; });
           maOn.value.forEach(function (k) {
             const n = parseInt(k, 10);
@@ -905,7 +1252,7 @@
         }
 
         // 画线 overlay (自定义系列: 水平线/线段/延长线/射线/矩形, 随缩放平移实时重绘)
-        if (annos.value.length) {
+        if (!lite && annos.value.length) {
           series.push({
             name: '画线', type: 'custom', xAxisIndex: 0, yAxisIndex: 0,
             z: 30, silent: true, animation: false,
@@ -923,14 +1270,16 @@
                 if (!p || isNaN(p[0]) || isNaN(p[1])) return null;
                 return p;
               };
-              const pushLine = function (a2, b2, color) {
+              const pushLine = function (a2, b2, color, dash) {
                 if (!a2 || !b2) return;
                 const seg = clipLine(a2, b2, rect);
                 if (!seg) return;
+                const style = { stroke: color, lineWidth: 1.4 };
+                if (dash) style.lineDash = dash;
                 children.push({
                   type: 'line',
                   shape: { x1: seg[0][0], y1: seg[0][1], x2: seg[1][0], y2: seg[1][1] },
-                  style: { stroke: color, lineWidth: 1.4 },
+                  style: style,
                 });
               };
               annos.value.forEach(function (a) {
@@ -940,7 +1289,7 @@
                   children.push({
                     type: 'line',
                     shape: { x1: rect.x, y1: p[1], x2: rect.x + rect.width, y2: p[1] },
-                    style: { stroke: '#f2c14e', lineWidth: 1.4, lineDash: [5, 4] },
+                    style: { stroke: ANNO_RED, lineWidth: 1.4 },   // 同花顺红色
                   });
                 } else if (a.type === 'rect') {
                   const p1 = toPx(a.x1, a.y1), p2 = toPx(a.x2, a.y2);
@@ -954,7 +1303,7 @@
                     type: 'rect',
                     shape: { x: x, y: y, width: w, height: h },
                     // 对标同花顺形态统计: 描边 + 虚线, 不填充 → 不遮挡 K 线
-                    style: { fill: 'transparent', stroke: '#26a7ff', lineWidth: 1.2, lineDash: [4, 3] },
+                    style: { fill: 'transparent', stroke: ANNO_RED, lineWidth: 1.2, lineDash: [4, 3] },
                   });
                 } else if (a.type === 'arrow') {
                   // 箭头: 初始段细 → 末端粗 (分段逼近), 末端实心三角
@@ -972,7 +1321,7 @@
                       type: 'line',
                       shape: { x1: p1[0] + ux * len * t0, y1: p1[1] + uy * len * t0,
                                x2: p1[0] + ux * len * t1, y2: p1[1] + uy * len * t1 },
-                      style: { stroke: '#26a7ff', lineWidth: wdt },
+                      style: { stroke: ANNO_RED, lineWidth: wdt },
                     });
                   }
                   const hw = 9, hl = 12;
@@ -981,7 +1330,7 @@
                   children.push({
                     type: 'polygon',
                     shape: { points: [[p2[0], p2[1]], [bx + px * hw, by + py * hw], [bx - px * hw, by - py * hw]] },
-                    style: { fill: '#26a7ff' },
+                    style: { fill: ANNO_RED },
                   });
                 } else {
                   const p1 = toPx(a.x1, a.y1), p2 = toPx(a.x2, a.y2);
@@ -991,9 +1340,9 @@
                   const ux = dx / len, uy = dy / len;
                   const FAR = 6000;
                   if (a.type === 'ray') {
-                    pushLine(p1, [p1[0] + ux * FAR, p1[1] + uy * FAR], '#e6a23c');
-                  } else {   // line: 连续直线, 双向延长
-                    pushLine([p1[0] - ux * FAR, p1[1] - uy * FAR], [p1[0] + ux * FAR, p1[1] + uy * FAR], '#52c41a');
+                    pushLine(p1, [p1[0] + ux * FAR, p1[1] + uy * FAR], ANNO_RED, ANNO_DASH);
+                  } else {   // line: 双向延长, 点状样式
+                    pushLine([p1[0] - ux * FAR, p1[1] - uy * FAR], [p1[0] + ux * FAR, p1[1] + uy * FAR], ANNO_RED, ANNO_DASH);
                   }
                 }
               });
@@ -1003,7 +1352,7 @@
         }
 
         // 买卖点标记: 优先按日期定位到当前周期的K线 (切换周期后仍保留), 无日期时回退旧索引
-        const mp = marks.value.map(function (m) {
+        const mp = lite ? [] : marks.value.map(function (m) {
           let di = -1;
           if (m.date) {
             for (let i = preN; i < all.length; i++) {
@@ -1027,7 +1376,7 @@
 
         // 条件单触发点: 止盈/止损触发即平仓, 在主图标注 TP / SL
         const conds = (s.conditionals || []);
-        conds.forEach(function (c) {
+        if (!lite) conds.forEach(function (c) {
           if (c.status !== 'triggered' || !c.triggered_date) return;
           let di = -1;
           for (let i = preN; i < all.length; i++) {
@@ -1046,7 +1395,7 @@
         if (mp.length) series[0].markPoint = { silent: true, data: mp };
 
         // 训练起点分隔线 + 训练段背景高亮 (附加到主K线 series, 标注前置段/训练段分界)
-        if (preN > 0) {
+        if (preN > 0 && !lite) {
           series[0].markLine = {
             silent: true, symbol: 'none',
             lineStyle: { color: '#e6a23c', type: 'dashed', width: 1 },
@@ -1145,6 +1494,7 @@
             consumeDraw();
           } else annoAnchor.value = { x: di, y: y };
         }
+        syncAnnos();
         draw(true);
       }
 
@@ -1172,7 +1522,38 @@
       onMounted(function () {
         loadCategories();
         loadStrategies();
-        window.addEventListener('resize', function () { if (chart) chart.resize(); });
+        window.addEventListener('resize', function () {
+          if (chart) chart.resize();
+          if (dateOpen.value) computePos();
+        });
+        // 日历/搜索下拉: 点击外部关闭 (弹层为 fixed, 需排除触发块自身)
+        document.addEventListener('mousedown', function (e) {
+          if (!dateOpen.value && !codeOpen.value) return;
+          const t = e.target;
+          if (t && t.closest && (t.closest('.date-pop') || t.closest('.date-field') || t.closest('.code-search'))) return;
+          dateOpen.value = false; codeOpen.value = false;
+        });
+        // 容器滚动时(日历弹层为 fixed) 重新定位, 保证紧跟触发块
+        window.addEventListener('scroll', function () { if (dateOpen.value) computePos(); }, true);
+        // 快捷键盘: → 右箭头 = 观望一步 (等同点击「观望」); ↑/↓ = 缩放滑动条范围; Esc 关闭浮层
+        window.addEventListener('keydown', function (e) {
+          if (e.key === 'Escape' && (dateOpen.value || codeOpen.value)) {
+            dateOpen.value = false; codeOpen.value = false; codeResults.value = [];
+            if (e.target && e.target.blur) e.target.blur();
+            return;
+          }
+          if (!props.active) return;
+          const tag = (e.target && e.target.tagName) || '';
+          if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || e.target && e.target.isContentEditable) return;
+          // 需求101506-4: ↑/↓ 缩放主图滑动条范围 (与训练是否进行中无关)
+          if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+            e.preventDefault();
+            if (chart) window.KZoom(chart, e.key === 'ArrowUp' ? 'in' : 'out');
+            return;
+          }
+          if (!session.value || session.value.status !== 'active') return;
+          if (e.key === 'ArrowRight') { e.preventDefault(); holdAndAdvance(); }
+        });
         // 黑白主题切换 → 按新配色重绘当前训练图 (ECharts 需重新取值)
         window.addEventListener('themechange', function () {
           if (!session.value) return;
@@ -1180,28 +1561,49 @@
           disposePre();
           showCurrentIntraday();
         });
+        // 登录/登出/补绑手机号 → 立即刷新「可开始训练」状态 (无需切 Tab) + 重新预生成
+        window.addEventListener('authchange', function () {
+          refreshLogin();
+          if (!session.value) schedulePrime();
+        });
+        if (props.active) schedulePrime();       // 需求101604: 首次挂载即预生成
       });
 
       // Tab 切回训练时: 隐藏期间容器尺寸为 0, 需要重新建图 / resize
       watch(function () { return props.active; }, async function (v) {
         refreshLogin();
-        if (!v || !session.value) return;
+        if (!v) return;
+        loadCategories(true);                      // 需求101701-2: 每次进入训练模块刷新品类
+        if (!session.value) { prime(); return; }   // 需求101604: 未开局 → 提前预生成本局数据
         await ensureChart();
         draw();
         disposePre();
         showCurrentIntraday();
       });
 
+      // 需求101604: 开局参数变化 → 去抖后重新预生成 (保证点击时数据已备好)
+      watch(function () {
+        return [form.category, form.bars, form.code, form.start_date,
+                form.initial_capital, form.leverage, form.strategy_id].join('|');
+      }, function () { if (!session.value) schedulePrime(); });
+
       // 均线开关变化 → 保留视图重绘
       watch(maOn, function () { draw(true); });
 
       return {
         categories, strategies, session, loading, error, form, newStrategyName,
-        loggedIn,
+        loggedIn, notice,
+        // 需求2: 指定标的搜索
+        codeKw, codeResults, codeOpen, codeLabel, onCodeInput, onCodeFocus,
+        pickCode, pickCodeFirst, closeCodeList, clearCodeKw,
+        // 需求1+4: 自定义日历弹层
+        availHint, dateOpen, dateField, datePopStyle, dowLabels, quickRanges,
+        calY, calM, calCells, calTip, todayStr, toggleCalendar, closeCalendar,
+        stepMonth, stepYear, pickDate, clearDate, quickPick,
         barsMax, barsStep,
         note, savedMsg, qty, positionRatio,
         condKind, condPrice, condTrail, condRatio, condNotice, activeConds, firedConds, skippedConds, setConditional, cancelConditional,
-        progressPct, pnlClass,
+        progressPct, pnlClass, canBuy, sellLocked,
         trainPeriods,
         preBars, preCount, preDate, preAmp,
         maKeys, maOn, resetMa,

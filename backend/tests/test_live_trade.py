@@ -12,7 +12,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 from app.models import KLine
+from app.core.config import settings
 from app.services.live_trade import LiveTradeManager
+
+
+@pytest.fixture(autouse=True)
+def _allow_trading_anytime(monkeypatch):
+    """默认关闭交易时间门禁, 使既有撮合用例可在任意时刻运行
+
+    门禁本身的用例在 TestTradingGate 中显式开启并单独验证。
+    """
+    monkeypatch.setattr(settings, "ENFORCE_TRADING_TIME", False, raising=False)
 
 
 # ---------- 测试替身 ----------
@@ -25,15 +35,20 @@ def mk(date_str: str, close: float, volume: int, amount: float, o=None) -> KLine
 
 
 class FakeFeed:
-    def __init__(self, klines, days):
+    def __init__(self, klines, days, market_open=True):
         self.klines = klines
         self.days = days
+        self.market_open = market_open
 
     def get_kline(self, code):
         return self.klines.get(code, [])
 
     def get_trading_days(self):
         return self.days
+
+    def market_ref_day(self):
+        """返回 (基准日, 是否开市); 供交易时间门禁判定"""
+        return (self.days[-1] if self.days else None), self.market_open
 
 
 class FakeRegistry:
@@ -134,8 +149,29 @@ class TestSnapshot:
         assert s["prev_close"] == 100.0
         assert s["limit_up"] == 110.0
         assert s["limit_down"] == 90.0
-        assert s["max_order_amount"] == round(1_200_000_000.0 * 0.05, 2)
+        # 单笔上限基准 = 上一交易日(D1)成交额 10 亿 → 5% = 5000 万
+        assert s["basis_amount"] == 1_000_000_000.0
+        assert s["basis_date"] == "2026-01-05"
+        assert s["max_order_amount"] == round(1_000_000_000.0 * 0.05, 2)
+        assert s["at_limit_up"] is False
+        assert s["at_limit_down"] is False
         assert s["suspended"] is False
+
+    def test_at_limit_up_flag(self, mgr, feed):
+        """收盘价 = 涨停价 → at_limit_up 为真"""
+        feed.klines["600519"][-1].close = 110.0     # 100 * 1.1
+        s = mgr.market_snapshot("600519")
+        assert s["at_limit_up"] is True
+
+    def test_basis_falls_back_when_prev_amount_zero(self, mgr):
+        """上一交易日成交额为 0 时回退到末根成交额"""
+        feed = FakeFeed({"600519": [
+            mk("2026-01-05", 100.0, 0, 0.0),
+            mk("2026-01-06", 105.0, 1_200_000, 1_200_000_000.0),
+        ]}, [D1, D2])
+        LiveTradeManager._instance = None
+        m = LiveTradeManager(feed, FakeRegistry(), db_path=mgr.db_path.parent / "b.db")
+        assert m.market_snapshot("600519")["max_order_amount"] == round(1_200_000_000.0 * 0.05, 2)
 
     def test_suspended_flag(self, mgr):
         assert mgr.market_snapshot("600000")["suspended"] is True
@@ -211,6 +247,89 @@ class TestFivePercentRule:
         m = LiveTradeManager(feed, FakeRegistry(), db_path=mgr.db_path.parent / "z.db")
         with pytest.raises(ValueError):
             m.place_order("u1", "000002", "BUY", "MARKET", quantity=100)
+
+
+# ================= 交易时间门禁 (需求1) =================
+
+class TestTradingGate:
+    def test_closed_day_blocks_order(self, tmp_path, monkeypatch):
+        """非交易日 → 下单失败, 不撮合"""
+        monkeypatch.setattr(settings, "ENFORCE_TRADING_TIME", True, raising=False)
+        feed = FakeFeed(copy.deepcopy(BARS), [D1, D2], market_open=False)
+        LiveTradeManager._instance = None
+        m = LiveTradeManager(feed, FakeRegistry(), db_path=tmp_path / "gate.db")
+        with pytest.raises(ValueError, match="非交易时间"):
+            m.place_order("u1", "600519", "BUY", "MARKET", quantity=100)
+        assert m.get_account("u1")["positions"] == []
+
+    def test_outside_session_blocks_order(self, tmp_path, monkeypatch):
+        """交易日但当前不在交易时段 → 下单失败"""
+        monkeypatch.setattr(settings, "ENFORCE_TRADING_TIME", True, raising=False)
+        monkeypatch.setattr(settings, "MORNING_OPEN", "09:30", raising=False)
+        monkeypatch.setattr(settings, "MORNING_CLOSE", "09:31", raising=False)
+        monkeypatch.setattr(settings, "AFTERNOON_OPEN", "13:00", raising=False)
+        monkeypatch.setattr(settings, "AFTERNOON_CLOSE", "13:01", raising=False)
+        feed = FakeFeed(copy.deepcopy(BARS), [D1, D2], market_open=True)
+        LiveTradeManager._instance = None
+        m = LiveTradeManager(feed, FakeRegistry(), db_path=tmp_path / "gate2.db")
+        if m._is_market_open():     # 恰好在测试时段内运行时跳过 (极低概率)
+            pytest.skip("当前处于交易时段")
+        with pytest.raises(ValueError, match="非交易时间"):
+            m.place_order("u1", "600519", "BUY", "MARKET", quantity=100)
+
+    def test_in_session_allows_order(self, tmp_path, monkeypatch):
+        """交易日且在交易时段内 → 正常成交"""
+        monkeypatch.setattr(settings, "ENFORCE_TRADING_TIME", True, raising=False)
+        monkeypatch.setattr(settings, "MORNING_OPEN", "00:00", raising=False)
+        monkeypatch.setattr(settings, "MORNING_CLOSE", "23:59", raising=False)
+        feed = FakeFeed(copy.deepcopy(BARS), [D1, D2], market_open=True)
+        LiveTradeManager._instance = None
+        m = LiveTradeManager(feed, FakeRegistry(), db_path=tmp_path / "gate3.db")
+        o = m.place_order("u1", "600519", "BUY", "MARKET", quantity=100)
+        assert o["status"] == "FILLED"
+
+    def test_closed_day_no_pending_fill(self, mgr, monkeypatch, feed):
+        """闭市不撮合挂单"""
+        o = mgr.place_order("u1", "600519", "BUY", "LIMIT", price=95.0, quantity=100)
+        assert o["status"] == "PENDING"
+        monkeypatch.setattr(settings, "ENFORCE_TRADING_TIME", True, raising=False)
+        feed.market_open = False
+        feed.klines["600519"][-1].close = 93.0
+        assert mgr.try_fill_pending("u1") == []
+
+    def test_gate_disabled_returns_true(self, mgr, monkeypatch, feed):
+        monkeypatch.setattr(settings, "ENFORCE_TRADING_TIME", False, raising=False)
+        feed.market_open = False
+        assert mgr._is_market_open() is True
+
+
+# ================= 涨停板 (需求3) =================
+
+class TestLimitUp:
+    def test_buy_at_limit_up_rejected(self, mgr, feed):
+        feed.klines["600519"][-1].close = 110.0        # 相对昨收 100 封涨停
+        assert mgr.market_snapshot("600519")["at_limit_up"] is True
+        with pytest.raises(ValueError, match="涨停"):
+            mgr.place_order("u1", "600519", "BUY", "MARKET", quantity=100)
+
+    def test_sell_at_limit_up_not_blocked(self, mgr, feed):
+        """涨停仅限制买入; 持仓仍可正常卖出"""
+        mgr.place_order("u1", "600519", "BUY", "MARKET", quantity=100)
+        advance_day(feed)                              # D3 close 105, available=100
+        feed.klines["600519"][-1].close = 115.5        # D3 相对 D2(105) 封涨停
+        assert mgr.market_snapshot("600519")["at_limit_up"] is True
+        o = mgr.place_order("u1", "600519", "SELL", "MARKET", quantity=100)
+        assert o["status"] == "FILLED"
+
+
+# ================= 停牌 (需求2) =================
+
+class TestSuspendedSell:
+    def test_sell_suspended_rejected(self, mgr):
+        """收盘停牌个股不可卖出"""
+        assert mgr.market_snapshot("600000")["suspended"] is True
+        with pytest.raises(ValueError, match="停牌"):
+            mgr.place_order("u1", "600000", "SELL", "MARKET", quantity=100)
 
 
 # ================= 限价挂单 / 懒撮合 / 撤单 =================

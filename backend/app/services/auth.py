@@ -22,6 +22,19 @@ _TOKEN_DAYS = 7
 _PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# 账号格式约定: 4-20 位, 字母开头, 仅含字母/数字/下划线 (便于账号唯一且可读)
+_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,19}$")
+# 密码复杂度: 长度 8-64, 且需包含 [大写/小写/数字/特殊字符] 中至少三类
+_PW_CLASS_RES = (
+    re.compile(r"[a-z]"),
+    re.compile(r"[A-Z]"),
+    re.compile(r"\d"),
+    re.compile(r"[^A-Za-z0-9]"),
+)
+_PW_MIN_LEN = 8
+_PW_MAX_LEN = 64
+_PW_MIN_CLASSES = 3
+
 
 class AuthService:
     _instance = None
@@ -80,6 +93,25 @@ class AuthService:
     def valid_email(email: str) -> bool:
         return bool(_EMAIL_RE.match((email or "").strip()))
 
+    @staticmethod
+    def valid_username(username: str) -> bool:
+        return bool(_USERNAME_RE.match((username or "").strip()))
+
+    @staticmethod
+    def password_strength_error(password: str) -> str:
+        """返回复杂度不合规的中文提示, 合规返回空串"""
+        pw = password or ""
+        if len(pw) < _PW_MIN_LEN:
+            return f"密码至少 {_PW_MIN_LEN} 位"
+        if len(pw) > _PW_MAX_LEN:
+            return f"密码最多 {_PW_MAX_LEN} 位"
+        if any(ch.isspace() for ch in pw):
+            return "密码不能包含空格"
+        classes = sum(1 for r in _PW_CLASS_RES if r.search(pw))
+        if classes < _PW_MIN_CLASSES:
+            return "密码需包含大写字母、小写字母、数字、特殊字符中的至少三类"
+        return ""
+
     # ---------- 密码 ----------
     @staticmethod
     def _hash_password(password: str, salt_hex: Optional[str] = None) -> tuple[str, str]:
@@ -96,10 +128,11 @@ class AuthService:
         username = (username or "").strip()
         phone = (phone or "").strip()
         email = (email or "").strip()
-        if not username or len(username) < 2:
-            raise ValueError("用户名至少 2 个字符")
-        if len(password) < 6:
-            raise ValueError("密码至少 6 位")
+        if not self.valid_username(username):
+            raise ValueError("账号需 4-20 位, 以字母开头, 仅含字母/数字/下划线")
+        pw_err = self.password_strength_error(password)
+        if pw_err:
+            raise ValueError(pw_err)
         if not phone:
             raise ValueError("手机号必填")
         if not self.valid_phone(phone):

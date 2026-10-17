@@ -9,11 +9,15 @@
 from __future__ import annotations
 import sqlite3
 import re
+import time
 from pathlib import Path
 from typing import List, Dict, Optional
 
 
 DB_PATH = Path(__file__).resolve().parent / "trading.db"
+
+# 需求101602: /api/stocks 全量返回约 776KB, 属于「数据过大」; 加进程内缓存避免每次直查 SQLite
+_LIST_TTL = 600      # 10 分钟
 
 
 def pinyin_of(name: str) -> str:
@@ -33,6 +37,7 @@ class StockRegistry:
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or DB_PATH
         self._py_ready = False
+        self._list_cache: Dict[tuple, tuple] = {}     # (market, board) → (ts, rows)
         self._ensure_table()
 
     # ========== DB ==========
@@ -82,6 +87,7 @@ class StockRegistry:
                 rows
             )
         self._py_ready = True
+        self._list_cache.clear()          # 数据变更后失效缓存
         print(f"[StockRegistry] ✅ 写入 {len(rows)} 只股票 (耗时 {time.time():.1f}s)")
         return len(rows)
 
@@ -144,6 +150,10 @@ class StockRegistry:
         return len(rows)
 
     def list_all(self, market: Optional[str] = None, board: Optional[str] = None) -> List[Dict]:
+        key = (market, board)
+        hit = self._list_cache.get(key)
+        if hit and time.time() - hit[0] < _LIST_TTL:
+            return hit[1]
         sql = "SELECT * FROM stocks WHERE 1=1"
         params: list = []
         if market:
@@ -154,7 +164,9 @@ class StockRegistry:
             params.append(board)
         with self._conn() as c:
             rows = c.execute(sql, params).fetchall()
-            return [dict(r) for r in rows]
+        out = [dict(r) for r in rows]
+        self._list_cache[key] = (time.time(), out)
+        return out
 
     def count(self) -> int:
         with self._conn() as c:

@@ -56,5 +56,9 @@ dist/
 .vscode/
 *.swp
 
+# ===== 运行时行情快照缓存 (本地生成, 不入库) =====
+backend/app/data/*.json
+
 # ===== 项目内 AI/工具产物 =====
 .trae/
+.trae-html-share-packages/

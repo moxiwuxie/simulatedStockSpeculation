@@ -16,20 +16,9 @@
   'use strict';
   const { ref, computed, watch, onUnmounted } = Vue;
 
-  const API = '/api';   // 前端服务反向代理到后端 (同源)
   async function api(path, opts) {
-    const headers = { 'Content-Type': 'application/json' };
-    const token = localStorage.getItem('auth_token');
-    if (token) headers['Authorization'] = 'Bearer ' + token;
-    const res = await fetch(API + path, { headers, ...(opts || {}) });
-    if (!res.ok) {
-      const t = await res.text();
-      let msg = t;
-      try { msg = JSON.parse(t).detail || t; } catch (e) {}
-      throw new Error(msg || ('HTTP ' + res.status));
-    }
-    const ct = res.headers.get('content-type') || '';
-    return ct.includes('json') ? res.json() : res.text();
+    // 需求101602: 统一走预加载/缓存层 (只读GET缓存 + 并发去重), 见 preload.js
+    return window.__apiFetch(path, opts);
   }
 
   const money = function (x) {
@@ -154,10 +143,13 @@
 
     <div class="tb-row">
       <span class="tb-tip">
-        当日成交额 {{ money(quote?.amount) }} · 单笔上限
+        上一交易日({{ quote?.basis_date || '--' }})成交额 {{ money(quote?.basis_amount) }} · 单笔上限
         <b>¥{{ money(quote?.max_order_amount) }}</b> (成交额的 5%)
       </span>
-      <button class="btn primary" :disabled="loading || !orderCode" @click="submit">
+      <span v-if="side === 'BUY' && quote?.at_limit_up" class="tb-tip warn">⚠️ 已封涨停，无法买入</span>
+      <button class="btn primary"
+              :disabled="loading || !orderCode || (side === 'BUY' && quote?.at_limit_up)"
+              @click="submit">
         {{ loading ? '提交中...' : (side === 'BUY' ? '买入' : '卖出') }}
       </button>
     </div>

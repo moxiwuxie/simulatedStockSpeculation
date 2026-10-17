@@ -13,7 +13,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, date
+from datetime import datetime, date, time
 from pathlib import Path
 from typing import Optional, List
 
@@ -141,6 +141,30 @@ class LiveTradeManager:
             pass
         return date.today().isoformat()
 
+    def _is_market_open(self) -> bool:
+        """是否处于可下单时段: 今日为交易日 且 当前在交易时段内
+
+        非交易时间不存在新成交价, 撮合成交无意义; 关闭 settings.ENFORCE_TRADING_TIME
+        后可直接下单 (供联调/演示)。
+        """
+        if not getattr(settings, "ENFORCE_TRADING_TIME", True):
+            return True
+        is_open_day = True
+        fn = getattr(self.feed, "market_ref_day", None)
+        if callable(fn):
+            try:
+                _, is_open_day = fn()
+            except Exception:
+                is_open_day = True
+        if not is_open_day:
+            return False
+        now = datetime.now().time()
+        morning = (time.fromisoformat(settings.MORNING_OPEN)
+                   <= now <= time.fromisoformat(settings.MORNING_CLOSE))
+        afternoon = (time.fromisoformat(settings.AFTERNOON_OPEN)
+                     <= now <= time.fromisoformat(settings.AFTERNOON_CLOSE))
+        return morning or afternoon
+
     # ================= 档位 =================
 
     def list_tiers(self) -> List[dict]:
@@ -236,13 +260,23 @@ class LiveTradeManager:
         prev_close = round(float(prev.close), 2)
         price = round(float(last.close), 2)
         volume = int(getattr(last, "volume", 0) or 0)
-        # 成交额兜底: 末根 → 近 5 根均值
+        # 成交额展示兜底: 末根 → 近 5 根均值
         amount = float(getattr(last, "amount", 0) or 0)
         if amount <= 0:
             tail = [float(getattr(k, "amount", 0) or 0) for k in kl[-5:]]
             tail = [a for a in tail if a > 0]
             amount = sum(tail) / len(tail) if tail else 0.0
-        cap = round(amount * settings.MAX_ORDER_AMOUNT_RATIO, 2)
+        # 单笔上限基准 = 上一交易日成交额; 兜底链: 上一交易日 → 末根 → 近 5 根均值 → 0
+        last_amount = float(getattr(last, "amount", 0) or 0)
+        prev_amount = float(getattr(prev, "amount", 0) or 0)
+        basis = prev_amount if prev_amount > 0 else last_amount
+        if basis <= 0:
+            tail5 = [float(getattr(k, "amount", 0) or 0) for k in kl[-6:-1]]
+            tail5 = [a for a in tail5 if a > 0]
+            basis = sum(tail5) / len(tail5) if tail5 else 0.0
+        cap = round(basis * settings.MAX_ORDER_AMOUNT_RATIO, 2)
+        limit_up = round(prev_close * (1 + pct), 2)
+        limit_down = round(prev_close * (1 - pct), 2)
         return {
             "code": code,
             "name": info.get("name", code),
@@ -253,12 +287,16 @@ class LiveTradeManager:
             "low": round(float(last.low), 2),
             "volume": volume,
             "amount": round(amount, 2),
+            "basis_amount": round(basis, 2),
+            "basis_date": prev.timestamp.strftime("%Y-%m-%d"),
             "change_pct": round((price - prev_close) / prev_close * 100, 2) if prev_close else 0.0,
             "trade_date": last.timestamp.strftime("%Y-%m-%d"),
             "suspended": volume == 0,
             "is_kcb": is_kcb,
-            "limit_up": round(prev_close * (1 + pct), 2),
-            "limit_down": round(prev_close * (1 - pct), 2),
+            "limit_up": limit_up,
+            "limit_down": limit_down,
+            "at_limit_up": price >= limit_up - 1e-6,
+            "at_limit_down": price <= limit_down + 1e-6,
             "max_order_amount": cap,
             "max_order_ratio": settings.MAX_ORDER_AMOUNT_RATIO,
         }
@@ -285,8 +323,12 @@ class LiveTradeManager:
         snap = self.market_snapshot(code)
         if not snap:
             raise ValueError("该股暂无行情数据, 无法交易")
+        if not self._is_market_open():
+            raise ValueError("当前非交易时间, 无法下单")
         if snap["suspended"]:
             raise ValueError("该股当前停牌, 无法交易")
+        if side == "BUY" and snap["at_limit_up"]:
+            raise ValueError("该股已封涨停, 无法买入")
 
         today = self._today()
         acct = self._ensure_account(scope, tier)
@@ -567,8 +609,10 @@ class LiveTradeManager:
         return True
 
     def try_fill_pending(self, user_id: str) -> List[dict]:
-        """懒撮合: 现价触及限价时成交挂单 (仅当前体系)"""
+        """懒撮合: 现价触及限价时成交挂单 (仅当前体系); 闭市不撮合"""
         self._check_conditionals(user_id)
+        if not self._is_market_open():
+            return []
         scope = self._scope(user_id)
         self._roll_settlement(scope)
         today = self._today()
@@ -581,6 +625,9 @@ class LiveTradeManager:
             if not snap or snap["suspended"]:
                 continue
             px = snap["price"]
+            # 封板价为最高价 → 买单买不到
+            if o["side"] == "BUY" and px >= snap["limit_up"] - 1e-6:
+                continue
             if (o["type"] == "MARKET"
                     or (o["side"] == "BUY" and px <= o["price"])
                     or (o["side"] == "SELL" and px >= o["price"])):
@@ -650,7 +697,9 @@ class LiveTradeManager:
         return True
 
     def _check_conditionals(self, user_id: str) -> List[dict]:
-        """评估活跃条件单: 触发即尝试卖出, 不可操作则标记 skipped 并给出提示"""
+        """评估活跃条件单: 触发即尝试卖出, 不可操作则标记 skipped 并给出提示; 闭市不触发"""
+        if not self._is_market_open():
+            return []
         scope = self._scope(user_id)
         self._roll_settlement(scope)
         today = self._today()

@@ -7,21 +7,35 @@
 from __future__ import annotations
 import time
 from datetime import datetime as _dt
+from threading import Lock
 from typing import Optional, List, Dict
 
 _TTL = 600          # 缓存 10 分钟
+_MIN_TTL = 180      # 需求101602: 个股 1 分钟序列缓存 (≥板块分时 TTL, 重算时复用避免重复拉取)
+_DAY_TTL = 120      # 需求101602: 板块分时(当日)缓存 —— 拉长以让预加载结果在用户进入前保持有效
 _CACHE: Dict[str, tuple] = {}
+_LOCKS: Dict[str, Lock] = {}         # 单飞(single-flight): 同一 key 的并发重算只跑一次
+_LOCKS_GUARD = Lock()
 
 
-def _cache_get(key: str):
+def _cache_get(key: str, ttl: Optional[float] = None):
+    """读缓存; ttl 省略时用条目自身 TTL(缺省 _TTL)"""
     hit = _CACHE.get(key)
-    if hit and time.time() - hit[0] < _TTL:
-        return hit[1]
+    if hit:
+        eff = ttl or (hit[2] if len(hit) > 2 else _TTL)
+        if time.time() - hit[0] < eff:
+            return hit[1]
     return None
 
 
-def _cache_set(key: str, value):
-    _CACHE[key] = (time.time(), value)
+def _cache_set(key: str, value, ttl: Optional[float] = None):
+    _CACHE[key] = (time.time(), value, ttl if ttl else _TTL)
+
+
+def _single_flight(key: str) -> Lock:
+    """获取(或创建)某 key 的互斥锁; 配合双重检查避免并发重复计算"""
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(key, Lock())
 
 
 def _f(v) -> Optional[float]:
@@ -44,8 +58,12 @@ def _s(v) -> Optional[str]:
 
 
 def list_boards(kind: str = "industry") -> List[dict]:
-    """板块列表 [{label, name, pct, leader, leader_pct}] (新浪, 含分类标识)"""
-    key = f"boards|{kind}"
+    """板块列表 [{label, name, pinyin, pct, leader, leader_pct}] (新浪, 含分类标识)
+
+    pinyin: 需求101503-0 —— 供前端「本地映射数据」按板块名称/首字母离线匹配使用。
+    """
+    from ..data.stock_registry import pinyin_of
+    key = f"boards|{kind}|py1"
     hit = _cache_get(key)
     if hit is not None:
         return hit
@@ -54,9 +72,11 @@ def list_boards(kind: str = "industry") -> List[dict]:
     df = ak.stock_sector_spot(indicator=indicator)
     rows = []
     for _, r in df.iterrows():
+        nm = _s(r.get("板块"))
         rows.append({
             "label": _s(r.get("label")),
-            "name": _s(r.get("板块")),
+            "name": nm,
+            "pinyin": pinyin_of(nm or ""),
             "pct": _f(r.get("涨跌幅")),
             "leader": _s(r.get("股票名称")),
             "leader_pct": _f(r.get("个股-涨跌幅")),
@@ -103,23 +123,45 @@ def search_all_boards(kw: str, limit: int = 20) -> List[dict]:
 
 
 def board_stocks(kind: str, label: str) -> List[dict]:
-    """成分股 [{code, name, price, pct, nmc, turnover}] (新浪板块详情, 按涨跌幅正序)"""
+    """成分股 [{code, name, price, pct, nmc, turnover}] (新浪板块详情, 按涨跌幅正序)
+
+    直连新浪 getHQNodeData 分页拉取 —— akshare.stock_sector_detail 依赖的
+    getHQNodeStockCount 接口上游返回格式已变 (int(r.json()) 遇 list) 会整体抛错,
+    故自行分页直至空页/不足一页, 不再依赖 akshare。
+    """
     key = f"cons|{kind}|{label}"
     hit = _cache_get(key)
     if hit is not None:
         return hit
-    import akshare as ak
-    df = ak.stock_sector_detail(sector=label)
-    out = []
-    for _, r in df.iterrows():
-        out.append({
-            "code": _s(r.get("code")),
-            "name": _s(r.get("name")),
-            "price": _f(r.get("trade")),
-            "pct": _f(r.get("changepercent")),
-            "nmc": _f(r.get("nmc")),                  # 流通市值 (元) — 板块指数加权用
-            "turnover": _f(r.get("turnoverratio")),
-        })
+    import requests
+    from akshare.utils import demjson
+    url = ("http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           "Market_Center.getHQNodeData")
+    out, page = [], 1
+    while page <= 60:                       # 保险上限 (60*80=4800 只, 远超实际板块规模)
+        params = {"page": str(page), "num": "80", "sort": "symbol", "asc": "1",
+                  "node": label, "symbol": "", "_s_r_a": "page"}
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            rows = demjson.decode(r.text)
+        except Exception:
+            rows = None
+        if not rows:
+            break
+        if isinstance(rows, dict):
+            rows = [rows]
+        for row in rows:
+            out.append({
+                "code": _s(row.get("code")),
+                "name": _s(row.get("name")),
+                "price": _f(row.get("trade")),
+                "pct": _f(row.get("changepercent")),
+                "nmc": _f(row.get("nmc")),                  # 流通市值 (元) — 板块指数加权用
+                "turnover": _f(row.get("turnoverratio")),
+            })
+        if len(rows) < 80:
+            break
+        page += 1
     out.sort(key=lambda x: (x["pct"] is None, x["pct"] if x["pct"] is not None else 0))  # 涨跌幅正序
     _cache_set(key, out)
     return out
@@ -165,14 +207,24 @@ def _board_index_full(feed, kind: str, label: str, period: str = "day"):
     hit = _cache_get(key)
     if hit is not None:
         return hit
-    from .replay_feed import ReplayFeed
-    cons = board_stocks(kind, label)
-    codes = _top_codes(cons, _INDEX_N)
-    series = _fetch_daily_series(feed, codes)
-    klines = _composite_index(series, base=1000.0) if series else []
-    agg = ReplayFeed.aggregate(klines, period) if klines else []
-    _cache_set(key, agg)
-    return agg
+    lk = _single_flight(key)
+    if not lk.acquire(blocking=False):
+        lk.acquire()                       # 已有并发在算: 等它算完直接读缓存
+        hit = _cache_get(key)
+        if hit is not None:
+            lk.release()
+            return hit
+    try:
+        from .replay_feed import ReplayFeed
+        cons = board_stocks(kind, label)
+        codes = _top_codes(cons, _INDEX_N)
+        series = _fetch_daily_series(feed, codes)
+        klines = _composite_index(series, base=1000.0) if series else []
+        agg = ReplayFeed.aggregate(klines, period) if klines else []
+        _cache_set(key, agg)
+        return agg
+    finally:
+        lk.release()
 
 
 def _fetch_daily_series(feed, codes: List[str]) -> Dict[str, Dict[str, dict]]:
@@ -195,7 +247,8 @@ def _fetch_daily_series(feed, codes: List[str]) -> Dict[str, Dict[str, dict]]:
     result: Dict[str, Dict[str, dict]] = {}
     if not codes:
         return result
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    # 需求101602: 与成分股数量对齐并发度, 缩短板块K线冷启动
+    with ThreadPoolExecutor(max_workers=max(8, len(codes))) as ex:
         for code, m in ex.map(one, codes):
             if m:
                 result[code] = m
@@ -252,6 +305,31 @@ def _sina_symbol(code: str) -> str:
 
 
 def board_intraday(feed, kind: str, label: str, date: Optional[str] = None) -> dict:
+    """板块分时 (带缓存 + 单飞): 合成计算约需数秒, 缓存避免重复拉取
+
+    - 当日/最新分时: 60s 短缓存 (随盘更新)
+    - 指定历史日期: 600s 长缓存 (结果稳定)
+    """
+    key = f"bintra|{kind}|{label}|{date or 'L'}"
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+    lk = _single_flight(key)
+    if not lk.acquire(blocking=False):
+        lk.acquire()
+        hit = _cache_get(key)
+        if hit is not None:
+            lk.release()
+            return hit
+    try:
+        data = _board_intraday_calc(feed, kind, label, date)
+        _cache_set(key, data, 600 if date else _DAY_TTL)
+        return data
+    finally:
+        lk.release()
+
+
+def _board_intraday_calc(feed, kind: str, label: str, date: Optional[str] = None) -> dict:
     """板块分时: 成分股(前 N 只)真实 1 分钟按成交量加权合成
 
     - 每只成分股先转成「相对自身昨收的涨跌幅」(复权无关), 再按成交量加权
@@ -340,10 +418,18 @@ def _empty_intraday(date, hint: str) -> dict:
 
 
 def _fetch_minute(codes: List[str]) -> Dict[str, List[dict]]:
-    """并发拉取新浪 1 分钟数据 (仅最近约 5 个交易日)"""
+    """并发拉取新浪 1 分钟数据 (仅最近约 5 个交易日)
+
+    按个股缓存 90s: 板块分时缓存(60s)过期后重算时可直接复用分钟序列,
+    避免每次都重新拉取 10 只成分股的分钟数据 (冷启动 3~7s 的主要来源)。
+    """
     from concurrent.futures import ThreadPoolExecutor
 
     def one(code):
+        key = f"min1|{code}"
+        hit = _cache_get(key, _MIN_TTL)
+        if hit is not None:
+            return code, hit
         try:
             import akshare as ak
             df = ak.stock_zh_a_minute(symbol=_sina_symbol(code), period="1")
@@ -363,12 +449,15 @@ def _fetch_minute(codes: List[str]) -> Dict[str, List[dict]]:
             except (TypeError, ValueError):
                 p = 0.0
             rows.append({"day": ts[:10], "time": ts[11:16], "price": p, "volume": max(v, 1.0)})
+        if rows:
+            _cache_set(key, rows, _MIN_TTL)
         return code, rows
 
     out: Dict[str, List[dict]] = {}
     if not codes:
         return out
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    # 需求101602: 成分股数量 (_MINUTE_N=10) 全部并发, 避免两波串行拉取放大冷启动耗时
+    with ThreadPoolExecutor(max_workers=max(8, len(codes))) as ex:
         for code, rows in ex.map(one, codes):
             if rows:
                 out[code] = rows

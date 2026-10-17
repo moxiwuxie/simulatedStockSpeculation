@@ -7,11 +7,13 @@
 from __future__ import annotations
 import json
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, date
 from typing import Literal, Optional, List
-from fastapi import FastAPI, HTTPException, Query, Header, Depends
+from fastapi import FastAPI, HTTPException, Query, Header, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
 from .models import Account, Order, OrderSide, OrderType, OrderStatus, Stock
@@ -44,8 +46,9 @@ class SeekRequest(BaseModel):
 
 
 class AuthRegisterRequest(BaseModel):
-    username: str = Field(..., min_length=2, max_length=40)
-    password: str = Field(..., min_length=6, max_length=64)
+    # 账号格式(4-20位字母开头)与密码复杂度由服务层校验, 以便返回中文提示
+    username: str = Field(..., min_length=1, max_length=40)
+    password: str = Field(..., min_length=1, max_length=64)
     phone: str = Field("", max_length=20)      # 必填, 交服务层校验并给中文提示
     email: str = Field("", max_length=80)
 
@@ -66,8 +69,11 @@ class WatchGroupRequest(BaseModel):
 
 class WatchItemRequest(BaseModel):
     group_id: Optional[int] = None
-    code: str = Field(..., min_length=6, max_length=6)
+    # 需求101506-2: 板块名/指数代码均可能超过 6 字符, 放宽长度; kind 区分个股/板块/指数
+    code: str = Field(..., min_length=1, max_length=64)
     name: str = ""
+    kind: str = "stock"                      # stock | board | index
+    meta: str = ""                           # JSON: 板块 {boardKind,label} / 指数 {code,symbol}
 
 
 class WatchImportRequest(BaseModel):
@@ -131,6 +137,92 @@ replay = ReplayEngine(feed, registry)
 live_mgr = LiveTradeManager(feed, registry)
 
 
+def _wl_quote(item: dict) -> dict:
+    """需求101506-1/2: 自选项统一报价 (个股/板块/指数), 供自选分组批量返回与概览复用"""
+    kind = str(item.get("kind") or "stock")
+    meta: dict = {}
+    raw = item.get("meta") or ""
+    if raw:
+        try:
+            meta = json.loads(raw) or {}
+        except Exception:
+            meta = {}
+    if kind == "board":
+        try:
+            from .services.boards import board_index
+            rows = board_index(feed, meta.get("boardKind") or "industry",
+                               meta.get("label") or item.get("name") or "", days=3)
+            if rows:
+                k = rows[-1]
+                return {"price": k.get("close"), "change_pct": k.get("change_pct"),
+                        "prev_close": (rows[-2].get("close") if len(rows) > 1 else None),
+                        "suspended": False}
+        except Exception:
+            pass
+        return {}
+    if kind == "index":
+        try:
+            from .services.index_feed import index_quote
+            return index_quote(meta.get("code") or item.get("code") or "")
+        except Exception:
+            return {}
+    try:
+        from .services.market_spot import market_spot
+        spot = market_spot.get_spot() or {}
+    except Exception:
+        spot = {}
+    return spot.get(item.get("code")) or {}
+
+
+def _spot_map() -> dict:
+    """全市场实时快照字典 (code → 报价), 失败或整体不可用时返回空
+
+    需求101607: wait=False —— 批量列表接口不应等待在途的全市场刷新 (20~35s)。
+    """
+    try:
+        from .services.market_spot import market_spot
+        return market_spot.get_spot(wait=False) or {}
+    except Exception:
+        return {}
+
+
+def _quick_quote(code: str, spot: dict) -> dict:
+    """最新真实行情概况 {price, prev_close, change_pct, suspended}
+
+    需求101607: 优先复用「全市场快照」(一次拉取即覆盖全部标的, 查表 O(1)), 替代逐只
+    ``feed.get_kline()`` 冷取 akshare —— 后者单只 0.2~0.5s, 使批量接口 (搜索 30 只 /
+    未分组 300 只) 冷启动 2.8s~60s+ 超时。快照整体不可用时不回落逐只拉取 (避免退化),
+    仅当快照存在但缺该标的 (极少数) 才回落单只日K。
+    """
+    if not spot:
+        return {"suspended": True}
+    row = spot.get(code)
+    if row and row.get("price"):
+        return {"price": row.get("price"), "prev_close": row.get("prev_close"),
+                "change_pct": row.get("change_pct"),
+                "suspended": int(row.get("volume") or 0) == 0}
+    try:
+        kl = feed.get_kline(code)
+    except Exception:
+        kl = []
+    if kl:
+        k = kl[-1]
+        prev_close = kl[-2].close if len(kl) > 1 else k.open
+        return {"price": k.close, "prev_close": prev_close,
+                "change_pct": (round((k.close - prev_close) / prev_close * 100, 2)
+                               if prev_close else 0.0),
+                "suspended": k.volume == 0}
+    return {"suspended": True}
+
+
+def _install_watchlist_quote_provider():
+    from .services.watchlist import watchlist_svc
+    watchlist_svc.quote_provider = _wl_quote
+
+
+_install_watchlist_quote_provider()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 1) 确保股票注册表就绪
@@ -147,6 +239,21 @@ async def lifespan(app: FastAPI):
     # 4) 启动回放时钟 (默认从 2024-01-02 开始)
     replay.start()
 
+    # 5) 需求101602: 后台预热重接口 (>0.5s), 消除前端首次进入模块的冷启动等待
+    try:
+        from .services.preload import warm_async
+        warm_async(feed, registry)
+    except Exception as e:
+        print(f"[Startup] 预加载跳过: {e}")
+
+    # 6) 需求101801: 百人以内并发 —— 同步端点由 anyio 线程池托管, 默认上限仅 40,
+    #    提高上限以支撑 ~100 并发在线训练 (配合 SQLite WAL + busy_timeout 已足够)
+    try:
+        from anyio import to_thread
+        to_thread.current_default_thread_limiter().total_tokens = 96
+    except Exception as e:
+        print(f"[Startup] 线程池调整跳过: {e}")
+
     yield
     # 回放系统无后台线程, 无需 stop
 
@@ -154,6 +261,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="历史回放交易系统", version="3.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
+# 需求101702: 经 ngrok 等低速隧道访问时, 大体积 JSON (全市场快照 795KB / 看盘全景 / 板块K线)
+# 不压缩导致传输极慢。此处对 /api 响应启用 gzip; 需客户端带 Accept-Encoding (代理不再剥离该头)。
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 # ========== 回放控制 ==========
@@ -201,21 +311,12 @@ def replay_start():
 @app.get("/api/stocks/search")
 def stocks_search(keyword: str = Query(..., min_length=1), limit: int = 30):
     results = registry.search(keyword, limit)
-    # 附加最新真实日K概况 (不受回放时钟影响)
+    # 附加最新真实行情概况 (不受回放时钟影响); 需求101607: 复用全市场快照, 避免逐只冷取日K
+    spot = _spot_map()
     enriched = []
     for r in results:
         item = {k: v for k, v in r.items()}
-        kl = feed.get_kline(r["code"])
-        if kl:
-            k = kl[-1]
-            prev_close = kl[-2].close if len(kl) > 1 else k.open
-            item["price"] = k.close
-            item["prev_close"] = prev_close
-            item["change_pct"] = (round((k.close - prev_close) / prev_close * 100, 2)
-                                  if prev_close else 0.0)
-            item["suspended"] = k.volume == 0
-        else:
-            item["suspended"] = True
+        item.update(_quick_quote(r["code"], spot))
         enriched.append(item)
     return enriched
 
@@ -279,9 +380,11 @@ def stock_intraday(code: str, date: Optional[str] = None):
     响应附 market_open / is_today, 供前端标注「当日 / 上一交易日」
     """
     from datetime import datetime as _dt
-    from .services.intraday import generate_intraday, generate_intraday_real
+    from .services.intraday import (generate_intraday, generate_intraday_real,
+                                    build_intraday_from_minutes, minute_series)
 
     today = _dt.now().date()
+    ref_day = None
     # 确定目标日期
     if date:
         try:
@@ -292,7 +395,11 @@ def stock_intraday(code: str, date: Optional[str] = None):
     else:
         ref_day, market_open = feed.market_ref_day()          # 开市→当日, 不开市→上一交易日
         kl = feed.get_kline(code)
-        if feed.get_kline_on(code, ref_day) is not None:
+        # 需求101601: 当日开市且已有当日真实分钟数据 → 优先「当日」
+        # (akshare 日K通常收盘后才更新, 不这样处理会退到上一交易日的分时)
+        if market_open and minute_series(code).get(str(ref_day)):
+            day = ref_day
+        elif feed.get_kline_on(code, ref_day) is not None:
             day = ref_day
         elif kl:
             day = kl[-1].timestamp.date()                     # 停牌/未更新 → 回退该股最近日K
@@ -305,6 +412,13 @@ def stock_intraday(code: str, date: Optional[str] = None):
     k = feed.get_kline_on(code, day)
     prev = feed._prev_kline(code, day)
     if not k:
+        # 需求101601: 当日日K尚未更新, 但已有当日真实分钟数据 → 用分钟序列构造当日分时
+        if day == today:
+            data = build_intraday_from_minutes(
+                day, minute_series(code).get(str(day)), prev.close if prev else None,
+                {"market_open": market_open, "is_today": is_today})
+            if data:
+                return data
         return {"date": str(day), "prev_close": prev.close if prev else None,
                 "suspended": True, "points": [],
                 "market_open": market_open, "is_today": is_today,
@@ -394,6 +508,41 @@ def boards_intraday(board_name: str, kind: str = Query("industry", pattern="^(in
     return data
 
 
+# ========== 大盘指数行情 (需求5: 看盘点击指数跳转图表模块) ==========
+
+@app.get("/api/index/list")
+def index_list():
+    """常用大盘指数清单 (上证/深证/创业板/科创50/沪深300/北证50)"""
+    from .services.index_feed import list_indices
+    return {"indices": list_indices()}
+
+
+@app.get("/api/index/{code}/kline")
+def index_kline(code: str, days: int = Query(240, ge=20, le=1000),
+                period: Literal["day", "week", "month", "year"] = "day"):
+    """指数 K 线 (新浪日K, 支持日/周/月/年周期)"""
+    from .services.index_feed import index_kline as _index_kline
+    try:
+        rows = _index_kline(code, days=days, period=period)
+    except Exception as e:
+        raise HTTPException(502, f"指数K线获取失败: {e}")
+    if not rows:
+        raise HTTPException(404, "该指数暂无K线数据")
+    return rows
+
+
+@app.get("/api/index/{code}/intraday")
+def index_intraday(code: str, date: Optional[str] = None):
+    """指数分时 (真实 1 分钟优先, 缺失时按当日 OHLC 确定性重建)"""
+    from .services.index_feed import index_intraday as _index_intraday
+    try:
+        return _index_intraday(code, date=date)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"指数分时获取失败: {e}")
+
+
 # ========== 聚合搜索 (个股 + 板块, 支持代码/名称/首字母/模糊) ==========
 
 @app.get("/api/search")
@@ -402,20 +551,11 @@ def unified_search(kw: str = Query(..., min_length=1), limit: int = Query(12, ge
     from .services.boards import search_all_boards
     text = kw.strip()
     stocks = registry.search(text, limit)
+    spot = _spot_map()                     # 需求101607: 复用全市场快照
     enriched = []
     for r in stocks:
         item = {k: v for k, v in r.items()}
-        kl = feed.get_kline(r["code"])
-        if kl:
-            k = kl[-1]
-            prev_close = kl[-2].close if len(kl) > 1 else k.open
-            item["price"] = k.close
-            item["prev_close"] = prev_close
-            item["change_pct"] = (round((k.close - prev_close) / prev_close * 100, 2)
-                                  if prev_close else 0.0)
-            item["suspended"] = k.volume == 0
-        else:
-            item["suspended"] = True
+        item.update(_quick_quote(r["code"], spot))
         enriched.append(item)
     try:
         boards = search_all_boards(text, limit)
@@ -787,6 +927,15 @@ def watchlist_list(user_id: str = Depends(get_current_user_id)):
     return {"groups": watchlist_svc.list_groups(user_id)}
 
 
+@app.get("/api/watchlist/overview")
+def watchlist_overview(user_id: str = Depends(get_current_user_id)):
+    """需求9: 各分组涨跌幅概览 (顶部标签栏展示)"""
+    from .services.watchlist import watchlist_svc
+    if user_id == "default":
+        return {"groups": []}
+    return {"groups": watchlist_svc.groups_overview(user_id)}
+
+
 @app.post("/api/watchlist/group")
 def watchlist_add_group(req: WatchGroupRequest, user_id: str = Depends(require_user_id)):
     from .services.watchlist import watchlist_svc
@@ -811,9 +960,20 @@ def watchlist_del_group(group_id: int, user_id: str = Depends(require_user_id)):
 def watchlist_add_item(req: WatchItemRequest, user_id: str = Depends(require_user_id)):
     from .services.watchlist import watchlist_svc
     try:
-        return watchlist_svc.add_item(user_id, req.code, req.name, req.group_id)
+        return watchlist_svc.add_item(user_id, req.code, req.name, req.group_id,
+                                      kind=req.kind, meta=req.meta)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+@app.get("/api/watchlist/quotes")
+def watchlist_quotes(group_id: Optional[int] = None,
+                     user_id: str = Depends(get_current_user_id)):
+    """需求101506-1/2: 分组自选项 + 报价一次性批量返回 (个股/板块/指数)"""
+    from .services.watchlist import watchlist_svc
+    if user_id == "default":
+        return {"group_id": None, "items": []}
+    return watchlist_svc.group_quotes(user_id, group_id)
 
 
 @app.delete("/api/watchlist/item/{item_id}")
@@ -821,6 +981,57 @@ def watchlist_del_item(item_id: int, user_id: str = Depends(require_user_id)):
     from .services.watchlist import watchlist_svc
     watchlist_svc.remove_item(user_id, item_id)
     return {"success": True}
+
+
+# 分时缩略图缓存: code → (时间戳, 序列|None), 60s 内复用
+_SPARK_CACHE: dict = {}
+_SPARK_TTL = 60.0
+_SPARK_MAX = 20          # 单次请求上限 (前端一屏个股数量级)
+
+
+@app.get("/api/watchlist/sparklines")
+def watchlist_sparklines(codes: str = Query("", max_length=1200)):
+    """需求101508-2: 图表左侧个股列表的当日分时缩略图
+
+    返回 ``{"items": {code: [价格序列...]}}`` (等距下采样至 ≤48 点);
+    无真实分钟数据的代码不出现在 items 中 (前端回落展示涨跌幅文本)。
+    """
+    want = [c.strip() for c in (codes or "").split(",") if c.strip()][:_SPARK_MAX]
+    if not want:
+        return {"items": {}}
+    now = time.time()
+    out: dict = {}
+    todo: List[str] = []
+    for c in want:
+        hit = _SPARK_CACHE.get(c)
+        if hit and now - hit[0] < _SPARK_TTL:
+            if hit[1]:
+                out[c] = hit[1]
+        else:
+            todo.append(c)
+    if todo:
+        from concurrent.futures import ThreadPoolExecutor
+        from .services.intraday import minute_series
+
+        def _one(code: str):
+            try:
+                days = minute_series(code) or {}
+                if not days:
+                    return code, None
+                pts = [p for _, p, _ in days[max(days)]]
+                if len(pts) < 5:
+                    return code, None
+                step = max(1, len(pts) // 48)
+                return code, [round(p, 2) for p in pts[::step][:48]]
+            except Exception:                 # noqa: BLE001 - 缩略图非关键路径
+                return code, None
+
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for code, series in ex.map(_one, todo):
+                _SPARK_CACHE[code] = (now, series)
+                if series:
+                    out[code] = series
+    return {"items": out}
 
 
 @app.post("/api/watchlist/items")
@@ -832,15 +1043,18 @@ def watchlist_add_items(req: WatchItemsRequest, user_id: str = Depends(require_u
     for it in req.items:
         code = str(it.get("code") or "").strip()
         name = str(it.get("name") or "").strip()
+        kind = str(it.get("kind") or "stock").strip() or "stock"
+        meta = str(it.get("meta") or "")
         if not code or code in seen:
             skipped += 1
             continue
         seen.add(code)
-        if not name:
+        if not name and kind == "stock":
             row = registry.get(code)
             name = row["name"] if row else code
         try:
-            r = watchlist_svc.add_item(user_id, code, name, req.group_id)
+            r = watchlist_svc.add_item(user_id, code, name, req.group_id,
+                                       kind=kind, meta=meta)
         except ValueError:            # 分组不存在等
             skipped += 1
             continue
@@ -971,20 +1185,11 @@ def watchlist_ungrouped(limit: int = Query(300, ge=1, le=1000),
                for it in g.get("items", [])}
     rows = sorted((r for r in registry.list_all() if r["code"] not in watched),
                   key=lambda x: x["code"])[:limit]
+    spot = _spot_map()               # 需求101607: 复用全市场快照 (原逐只 get_kline 冷取会 >60s 超时)
     items = []
-    for r in rows:                    # 最新真实日K概况 (口径同 /api/stocks/search)
+    for r in rows:                    # 最新真实行情概况 (口径同 /api/stocks/search)
         item = {"code": r["code"], "name": r["name"], "market": r.get("market")}
-        kl = feed.get_kline(r["code"])
-        if kl:
-            k = kl[-1]
-            prev_close = kl[-2].close if len(kl) > 1 else k.open
-            item["price"] = k.close
-            item["prev_close"] = prev_close
-            item["change_pct"] = (round((k.close - prev_close) / prev_close * 100, 2)
-                                  if prev_close else 0.0)
-            item["suspended"] = k.volume == 0
-        else:
-            item["suspended"] = True
+        item.update(_quick_quote(r["code"], spot))
         items.append(item)
     return {"total": len(items), "items": items}
 
@@ -1050,15 +1255,23 @@ def dyn_groups_stocks(group_id: str, limit: int = Query(200, ge=1, le=1000),
     return {"group_id": group_id, "total": len(hits), "stocks": hits}
 
 
+@app.get("/api/dyn-groups/recent-metrics")
+def dyn_groups_recent_metrics(user_id: str = Depends(require_user_id)):
+    """当前用户最近使用过的指标 (供配置页「最近使用」分类快速复用)"""
+    from .services.dyn_group import dyn_group_svc
+    return {"metrics": dyn_group_svc.recent_metrics(user_id)}
+
+
 @app.post("/api/dyn-groups/preview")
-def dyn_groups_preview(req: DynPreviewRequest, _user_id: str = Depends(require_user_id)):
+def dyn_groups_preview(req: DynPreviewRequest, user_id: str = Depends(require_user_id)):
     """未保存规则的即时预览 (配置页查看命中数/样例)"""
-    from .services.dyn_group import evaluate, normalize_rules
+    from .services.dyn_group import dyn_group_svc, evaluate, normalize_rules
     from .services.market_spot import market_spot
     try:
         rules = normalize_rules(req.rules)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    dyn_group_svc.record_recent(user_id, [c["metric"] for c in rules["conditions"]])
     hits = evaluate(rules, market_spot.get_spot(), limit=req.limit)
     return {"total": len(hits), "stocks": hits}
 
@@ -1075,6 +1288,8 @@ class TrainStartRequest(BaseModel):
     period: Literal["day", "week", "month", "year"] = "day"
     # 随机抽标的时的「涨停次数档位权重」(无/低/中/高, 长度4); 仅 code 为空时生效
     limit_up_weights: Optional[List[float]] = Field(None, min_length=4, max_length=4)
+    # 指定起始日期 (YYYY-MM-DD): 与 code 同时给出 → 非双盲训练(名称与日期可见)
+    start_date: Optional[str] = None
 
 
 class TrainActionRequest(BaseModel):
@@ -1087,6 +1302,11 @@ class StrategyRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=40)
     description: str = ""
     color: str = "#00b5ff"
+
+
+class TrainAnnosRequest(BaseModel):
+    """训练划线数据 (需求3): 整体覆盖保存, 复盘历史对局同步渲染"""
+    annos: List[dict] = Field(default_factory=list)
 
 
 class TrainConditionalRequest(BaseModel):
@@ -1107,8 +1327,14 @@ class TrainPeriodRequest(BaseModel):
 
 
 @app.get("/api/training/categories")
-def train_categories():
-    """训练品类元数据 (股票双盲 + 长周期训练)"""
+def train_categories(response: Response):
+    """训练品类元数据 (股票双盲 + 长周期训练)
+
+    需求101701-2: 移动端曾因浏览器缓存旧响应而看不到「长周期训练」品类。
+    该接口不使用任何缓存 (no-store), 保证每次进入训练模块都拿到最新品类列表。
+    """
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
     from .services.training_session import (CATEGORY_LABELS, CATEGORY_LEVERAGE,
                                             CATEGORY_BARS_CAP, CATEGORY_DEFAULT_BARS)
     from .services.stock_pool import bucket_meta
@@ -1133,10 +1359,41 @@ def train_start(req: TrainStartRequest, user_id: str = Depends(require_user_id))
         s = training_mgr.start(req.category, req.bars, req.code, req.initial_capital,
                                leverage=req.leverage, strategy_id=req.strategy_id,
                                user_id=user_id, period=req.period,
-                               limit_up_weights=req.limit_up_weights)
+                               limit_up_weights=req.limit_up_weights,
+                               start_date=req.start_date)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return s.summary(hide_meta=True)
+
+
+@app.post("/api/training/prime")
+def train_prime(req: TrainStartRequest, user_id: str = Depends(require_user_id)):
+    """需求101604: 预生成一局训练数据 —— 在点击「开始训练」之前就把数据备好
+
+    返回 {"ready": 0/1}: ready=1 表示同参数的可复用数据已就绪, 点击开始训练近乎瞬时。
+    预生成不写库、不注册会话, 未被消费的数据随 TTL 自然失效 (不污染训练历史、不泄露标的)。
+    """
+    from .services.training_session import training_mgr
+    # 收益曲线归零时开局会被拦截 → 没必要预生成
+    if not training_mgr.equity_nav(user_id).get("can_start", True):
+        return {"ready": 0, "reason": "equity_reset"}
+    # 池内候选不足 → 后台扩容 (不阻塞本次响应), 避免随机抽标退化为现场探测慢路径
+    try:
+        from .services import stock_pool as pool
+        from .services.preload import warm_pool_async, POOL_MIN
+        if len(pool.candidates(req.bars + 30, only_intraday=True)) < POOL_MIN:
+            warm_pool_async(POOL_MIN)
+    except Exception:
+        pass
+    try:
+        s = training_mgr.prime(req.category, req.bars, req.code, req.initial_capital,
+                               leverage=req.leverage, strategy_id=req.strategy_id,
+                               user_id=user_id, period=req.period,
+                               limit_up_weights=req.limit_up_weights,
+                               start_date=req.start_date)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ready": 1 if s else 0}
 
 
 @app.get("/api/training/session/{session_id}")
@@ -1210,9 +1467,12 @@ def train_sell(session_id: str, req: TrainActionRequest):
 
 
 @app.post("/api/training/{session_id}/hold")
-def train_hold(session_id: str):
+def train_hold(session_id: str, advance: bool = Query(False)):
+    """观望; advance=true 时合并为「观望并立即推进一根」, 一次请求完成 (性能优化101701)"""
     from .services.training_session import training_mgr
     try:
+        if advance:
+            return training_mgr.hold_and_advance(session_id)
         s = training_mgr.hold(session_id)
     except (ValueError, AssertionError) as e:
         raise HTTPException(400, str(e) or "会话不存在或已结束")
@@ -1255,14 +1515,21 @@ def train_advance(session_id: str, steps: int = Query(1, ge=1, le=10)):
     s = training_mgr.get(session_id)
     if not s:
         raise HTTPException(404, "会话不存在")
-    result = {"session": s.summary(), "auto_settled": False}
+    first_fill = None
+    result = None
     try:
         for _ in range(steps):
             result = training_mgr.advance(session_id)
+            # 买入委托在推进后首根成交 → 保留首次成交结果 (批量推进时前端据此补买点)
+            if first_fill is None and result.get("pending_filled"):
+                first_fill = result["pending_filled"]
             if result.get("auto_settled") or result["session"].get("status") != "active":
                 break
     except (ValueError, AssertionError) as e:
         raise HTTPException(400, str(e) or "会话不存在或已结束")
+    if result is None:      # 兜底 (steps>=1 时不会走到)
+        result = {"session": s.summary(), "auto_settled": False}
+    result["pending_filled"] = first_fill
     return result
 
 
@@ -1316,6 +1583,25 @@ def train_history_detail(session_id: str, user_id: str = Depends(get_current_use
     return d
 
 
+@app.post("/api/training/{session_id}/annos")
+def train_save_annos(session_id: str, req: TrainAnnosRequest,
+                     user_id: str = Depends(get_current_user_id)):
+    """保存训练划线 (需求3): 按会话整体覆盖, 供复盘历史对局同步展示"""
+    from .services.training_session import training_mgr
+    if user_id == "default":
+        raise HTTPException(401, "请先登录")
+    n = training_mgr.save_annos(session_id, req.annos)
+    return {"saved": n}
+
+
+@app.get("/api/training/{session_id}/annos")
+def train_get_annos(session_id: str, user_id: str = Depends(get_current_user_id)):
+    from .services.training_session import training_mgr
+    if user_id == "default":
+        raise HTTPException(401, "请先登录")
+    return {"annos": training_mgr.get_annos(session_id)}
+
+
 # ========== 战法库 ==========
 
 @app.get("/api/strategies")
@@ -1362,6 +1648,26 @@ def review_equity_reset(user_id: str = Depends(require_user_id)):
     """重置收益曲线起点(保留全部训练记录), 累加并返回重置次数"""
     from .services.training_session import training_mgr
     return training_mgr.reset_equity(user_id)
+
+
+@app.get("/api/watch/panorama")
+def watch_panorama():
+    """真实看盘全景: 优先接入同花顺 iFinD (逐板块容错), 失败回落占位快照"""
+    from .services.watch import real_panorama, mock_panorama
+    try:
+        return real_panorama()
+    except Exception:                     # 兜底: 任何异常都返回完整占位结构, 保证接口不 5xx
+        return mock_panorama()
+
+
+@app.get("/api/preload")
+def trigger_preload(force: bool = False):
+    """需求101602: 触发后端预加载 —— 后台预热各重接口缓存, 立即返回进度
+
+    幂等: 预热进行中或已完成过则直接返回当前快照; force=true 时强制重新预热。
+    """
+    from .services.preload import warm_async
+    return warm_async(feed, registry, force=force)
 
 
 @app.get("/api/review/attribution")

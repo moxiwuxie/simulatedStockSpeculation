@@ -8,11 +8,14 @@
   - 上影线比例% = (最高 - max(今开, 最新)) / 昨收 * 100
   - 涨跌幅 / 成交量 / 成交额 / 最新价 / 今开 / 收盘价
 
-缓存: 默认 300s TTL, 避免每次 19s 的抓取; 拉取失败时回退上一份缓存。
+缓存 (需求101605): 默认 600s TTL + 单飞 + stale-while-revalidate + 磁盘快照, 避免 20~35s 冷拉
+阻塞「自选模块进入 / 切换分组」; 拉取失败时回退上一份缓存。
 """
 from __future__ import annotations
+import json
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 _CODE_PREFIXES = ("bj", "sh", "sz")
@@ -46,12 +49,51 @@ def _limit_pct(prefix: str, code: str, name: str) -> float:
 
 
 class MarketSpot:
-    def __init__(self, ttl: float = 300.0, fetcher: Optional[Callable[[], Any]] = None):
-        self._ttl = ttl
+    """需求101605: 单飞 + stale-while-revalidate
+
+    - 缓存新鲜 (<= ttl) → 直接返回
+    - 缓存已过期但有旧值 → **立即返回旧值**, 同时后台单飞刷新 (切分组不再卡 20~35s)
+    - 无任何缓存 (进程首次) → 同步拉取, 期间并发请求共享同一次拉取 (单飞, 避免各拉各的)
+    """
+
+    def __init__(self, ttl: float = 600.0, fetcher: Optional[Callable[[], Any]] = None):
+        self._ttl = ttl                    # 需求101605: 300 → 600 (与后端预热周期对齐)
         self._fetcher = fetcher          # 测试可注入假数据源
         self._cache: Dict[str, dict] = {}
         self._ts = 0.0
         self._lock = threading.RLock()
+        self._fetching = False           # 单飞标志: 同一时刻只允许一个拉取在跑
+        self._done = threading.Event()   # 等待首次拉取完成的信号
+        # 需求101605: 磁盘快照 —— 进程重启后首次进入自选也能「立即有旧值 + 后台刷新」
+        self._snap_path = Path(__file__).resolve().parent.parent / "data" / "market_spot.json"
+        if self._fetcher is None:        # 测试注入 fetcher 时不读磁盘, 避免串扰
+            self._load_snapshot()
+
+    # ---------- 磁盘快照 (跨进程重启复用) ----------
+    def _load_snapshot(self):
+        try:
+            if not self._snap_path.exists():
+                return
+            obj = json.loads(self._snap_path.read_text(encoding="utf-8"))
+            data = obj.get("data") if isinstance(obj, dict) else None
+            ts = float(obj.get("ts") or 0) if isinstance(obj, dict) else 0.0
+            if data:
+                with self._lock:
+                    self._cache = data
+                    self._ts = ts or self._snap_path.stat().st_mtime
+        except Exception:
+            pass
+
+    def _save_snapshot(self, data: Dict[str, dict]):
+        try:
+            self._snap_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._snap_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"ts": time.time(), "data": data},
+                                      ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            tmp.replace(self._snap_path)
+        except Exception:
+            pass
+
 
     # ---------- 数据源 ----------
     def _fetch(self):
@@ -120,22 +162,61 @@ class MarketSpot:
         return out
 
     # ---------- 对外 ----------
-    def get_spot(self, force: bool = False) -> Dict[str, dict]:
-        now = time.time()
+    def _refresh(self) -> Dict[str, dict]:
+        """执行一次拉取并写入缓存 (调用方需保证 _fetching 单飞语义)"""
         with self._lock:
-            if not force and self._cache and now - self._ts < self._ttl:
-                return self._cache
+            self._fetching = True
+            self._done.clear()
         try:
             data = self._parse(self._fetch())
-        except Exception as e:            # 断连 → 回退旧缓存, 不阻断接口
-            print(f"[MarketSpot] 全市场快照获取失败: {e}")
             with self._lock:
+                if data:
+                    self._cache = data
+                    self._ts = time.time()
+            if data and self._fetcher is None:
+                self._save_snapshot(data)     # 需求101605: 落盘, 供重启后秒用
+        except Exception as e:            # 断连 → 保留旧缓存, 不阻断接口
+            print(f"[MarketSpot] 全市场快照获取失败: {e}")
+        finally:
+            with self._lock:
+                self._fetching = False
+                self._done.set()
                 return self._cache
+
+    def get_spot(self, force: bool = False, wait: bool = True) -> Dict[str, dict]:
+        """取全市场快照
+
+        ``wait=False`` (需求101607): 若有在途刷新, 立即返回旧值而不等待 —— 供「批量列表
+        接口」(搜索/未分组, 一次要取几百只报价) 使用, 避免被全市场刷新 (20~35s) 阻塞。
+        """
+        now = time.time()
         with self._lock:
-            if data:
-                self._cache = data
-                self._ts = now
+            fresh = bool(self._cache) and not force and now - self._ts < self._ttl
+            if fresh:
+                return self._cache
+            has_stale = bool(self._cache)
+            if not self._fetching:
+                already = True           # 本线程抢到刷新权
+            else:
+                already = False
+        if already:
+            if has_stale:
+                # 需求101605: 有旧值 → 后台刷新, 立即返回旧值 (stale-while-revalidate)
+                def _bg():
+                    self._refresh()
+                threading.Thread(target=_bg, name="market-spot-refresh", daemon=True).start()
+                with self._lock:
+                    return self._cache
+            # 无缓存 (进程首次) → 同步拉取
+            return self._refresh()
+        if not wait and has_stale:
+            with self._lock:             # 需求101607: 不等待在途刷新, 直接用旧值
+                return self._cache
+        # 已有其他线程在拉取 → 等待它完成 (并发共享同一次拉取, 避免各拉各的)
+        self._done.wait(timeout=self._ttl)
+        with self._lock:
             return self._cache
+
 
 
 market_spot = MarketSpot()

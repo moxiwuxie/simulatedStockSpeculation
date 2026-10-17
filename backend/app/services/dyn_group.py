@@ -24,20 +24,24 @@ NUM_OPS = ["gt", "gte", "lt", "lte", "between"]
 BOOL_OPS = ["eq"]
 
 METRICS: List[dict] = [
-    {"key": "is_limit_up",   "label": "涨停",     "type": "bool",   "unit": "",  "ops": BOOL_OPS},
-    {"key": "is_limit_down", "label": "跌停",     "type": "bool",   "unit": "",  "ops": BOOL_OPS},
-    {"key": "is_zhaban",     "label": "炸板(曾涨停)", "type": "bool", "unit": "", "ops": BOOL_OPS},
-    {"key": "upper_shadow",  "label": "上影线比例", "type": "number", "unit": "%", "ops": NUM_OPS},
-    {"key": "change_pct",    "label": "涨跌幅",   "type": "number", "unit": "%", "ops": NUM_OPS},
-    {"key": "volume",        "label": "成交量",   "type": "number", "unit": "股", "ops": NUM_OPS},
-    {"key": "amount",        "label": "成交额",   "type": "number", "unit": "元", "ops": NUM_OPS},
-    {"key": "price",         "label": "最新价",   "type": "number", "unit": "元", "ops": NUM_OPS},
-    {"key": "open",          "label": "开盘价",   "type": "number", "unit": "元", "ops": NUM_OPS},
-    {"key": "close",         "label": "收盘价",   "type": "number", "unit": "元", "ops": NUM_OPS},
+    # cat: 指标分类 (前端按此渲染分类 Tab); hot: 是否标红「HOT」角标
+    {"key": "is_limit_up",   "label": "涨停",     "type": "bool",   "unit": "",  "ops": BOOL_OPS, "cat": "涨停异动", "hot": True},
+    {"key": "is_limit_down", "label": "跌停",     "type": "bool",   "unit": "",  "ops": BOOL_OPS, "cat": "涨停异动"},
+    {"key": "is_zhaban",     "label": "炸板(曾涨停)", "type": "bool", "unit": "", "ops": BOOL_OPS, "cat": "涨停异动"},
+    {"key": "upper_shadow",  "label": "上影线比例", "type": "number", "unit": "%", "ops": NUM_OPS, "cat": "技术面", "hot": True},
+    {"key": "change_pct",    "label": "涨跌幅",   "type": "number", "unit": "%", "ops": NUM_OPS, "cat": "技术面", "hot": True},
+    {"key": "volume",        "label": "成交量",   "type": "number", "unit": "股", "ops": NUM_OPS, "cat": "价格成交"},
+    {"key": "amount",        "label": "成交额",   "type": "number", "unit": "元", "ops": NUM_OPS, "cat": "价格成交"},
+    {"key": "price",         "label": "最新价",   "type": "number", "unit": "元", "ops": NUM_OPS, "cat": "价格成交", "hot": True},
+    {"key": "open",          "label": "开盘价",   "type": "number", "unit": "元", "ops": NUM_OPS, "cat": "价格成交"},
+    {"key": "close",         "label": "收盘价",   "type": "number", "unit": "元", "ops": NUM_OPS, "cat": "价格成交"},
 ]
 METRIC_MAP = {m["key"]: m for m in METRICS}
 BOOL_METRICS = {m["key"] for m in METRICS if m["type"] == "bool"}
 METRIC_KEYS = set(METRIC_MAP)
+
+# 「最近使用」分类保留的指标条数
+RECENT_LIMIT = 8
 
 # close 与 price 在快照中同源 (最新价即收盘价口径)
 _ALIAS = {"close": "price"}
@@ -152,7 +156,35 @@ class DynGroupService:
                 created_at TEXT,
                 UNIQUE (user_id, name)
             )""")
+            # 「最近使用」指标: 按账号记录用户用过的指标, 供分类 Tab 快速复用
+            conn.execute("""CREATE TABLE IF NOT EXISTS dyn_recent_metrics (
+                user_id TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                used_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, metric)
+            )""")
             conn.commit()
+
+    # ---------- 最近使用指标 ----------
+    def record_recent(self, user_id: str, metrics) -> None:
+        """记录用户本次用到的指标 (按账号持久化, 重复使用刷新时间)"""
+        keys = [k for k in dict.fromkeys(metrics or []) if k in METRIC_KEYS]
+        if not keys:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        with closing(self._open()) as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO dyn_recent_metrics (user_id, metric, used_at) VALUES (?,?,?)",
+                [(user_id, k, now) for k in keys])
+            conn.commit()
+
+    def recent_metrics(self, user_id: str, limit: int = RECENT_LIMIT) -> List[str]:
+        """最近使用过的指标 (最近优先, 已下架指标自动过滤)"""
+        with closing(self._open()) as conn:
+            rows = conn.execute(
+                "SELECT metric FROM dyn_recent_metrics WHERE user_id=? ORDER BY used_at DESC LIMIT ?",
+                (user_id, limit)).fetchall()
+        return [r["metric"] for r in rows if r["metric"] in METRIC_KEYS]
 
     # ---------- CRUD ----------
     def list_groups(self, user_id: str) -> List[dict]:
@@ -192,6 +224,7 @@ class DynGroupService:
         if name in {p["name"] for p in PRESETS}:
             raise ValueError(f"名称「{name}」与内置预设冲突")
         rules = normalize_rules(rules)
+        self.record_recent(user_id, [c["metric"] for c in rules["conditions"]])
         try:
             with closing(self._open()) as conn:
                 conn.execute("INSERT INTO dyn_groups (user_id, name, rules, created_at) VALUES (?,?,?,?)",
@@ -212,6 +245,7 @@ class DynGroupService:
             raise ValueError("动态分组不存在")
         new_name = (name or cur["name"]).strip() or cur["name"]
         new_rules = normalize_rules(rules) if rules is not None else cur["rules"]
+        self.record_recent(user_id, [c["metric"] for c in new_rules["conditions"]])
         try:
             with closing(self._open()) as conn:
                 conn.execute("UPDATE dyn_groups SET name=?, rules=? WHERE id=? AND user_id=?",

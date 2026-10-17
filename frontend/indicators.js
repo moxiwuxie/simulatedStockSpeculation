@@ -211,6 +211,45 @@
     return { dif: dif, dea: dea, hist: hist };
   }
 
+  /**
+   * 需求101506-4: K 线区域 ↑/↓ 键缩放滑动条范围 (以当前窗口中心为锚点)
+   * dir: 'in' 缩小范围(放大) | 'out' 扩大范围(缩小)
+   * 读取第一个 dataZoom 的 startValue/endValue (缺省时按百分比换算),
+   * 重算后对所有 dataZoom 同时 dispatchAction, 保持 inside/slider 一致。
+   */
+  function zoomDataZoom(chart, dir) {
+    if (!chart || typeof chart.isDisposed === 'function' && chart.isDisposed()) return;
+    var opt = chart.getOption();
+    var dzs = opt.dataZoom || [];
+    if (!dzs.length) return;
+    var main = dzs[0] || {};
+    var xiv = main.xAxisIndex;
+    var xi = Array.isArray(xiv) ? (xiv[0] || 0) : (xiv == null ? 0 : xiv);
+    var axes = opt.xAxis || [];
+    var ax = axes[xi] || axes[0] || {};
+    var total = (ax.data || []).length;
+    if (!total) return;
+    var s = main.startValue, e = main.endValue;
+    if (typeof s !== 'number') s = Math.round((main.start == null ? 0 : main.start) / 100 * (total - 1));
+    if (typeof e !== 'number') e = Math.round((main.end == null ? 100 : main.end) / 100 * (total - 1));
+    s = Math.max(0, Math.min(total - 1, s));
+    e = Math.max(0, Math.min(total - 1, e));
+    if (e < s) { var t0 = s; s = e; e = t0; }
+    var span = e - s + 1;
+    var k = dir === 'in' ? 0.8 : 1.25;
+    var nspan = Math.min(total, Math.max(10, Math.round(span * k)));
+    var c = Math.round((s + e) / 2);
+    var ns = c - Math.floor(nspan / 2);
+    var ne = ns + nspan - 1;
+    if (ns < 0) { ns = 0; ne = nspan - 1; }
+    if (ne > total - 1) { ne = total - 1; ns = Math.max(0, ne - nspan + 1); }
+    dzs.forEach(function (d, i) {
+      chart.dispatchAction({ type: 'dataZoom', dataZoomIndex: i, startValue: ns, endValue: ne });
+    });
+  }
+
+  global.KZoom = zoomDataZoom;
+
   global.Indicators = {
     sma: sma, ema: ema, boll: boll, cci: cci, bias: bias, sar: sar, atr: atr, macd: macd,
     overlaySeries: overlaySeries,

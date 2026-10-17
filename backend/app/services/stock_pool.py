@@ -18,6 +18,7 @@
 from __future__ import annotations
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -30,6 +31,8 @@ STAT_WINDOW = 250
 LIMIT_UP_TOL = 0.005
 # 单次开训最多探测的候选数 (网络开销上界)
 MAX_PROBE = 12
+# 需求101604: 现场探测的并发度 (串行拉 12 只日K+分时最坏可达 10~24s, 并发后约 1~2 轮)
+PROBE_WORKERS = 6
 # 池内统计的保鲜期 (天), 超期允许重探
 FRESH_DAYS = 1
 
@@ -316,14 +319,16 @@ def pick_code(bars_needed: int, weights: Optional[List[float]] = None,
                         "limit_up_bucket": bk, "limit_up_label": bucket_label(bk),
                         "market": row.get("market") or "", "board": row.get("board") or "",
                         "is_kcb": row.get("is_kcb") or 0}
-    # ---- 2) 池无目标档 → 现场探测 ----
+    # ---- 2) 池无目标档 → 现场探测 (需求101604: 并发探测, 避免串行拉日K/分时拖慢开局) ----
     codes = _ledger_codes()
     if not codes:
         return None
     random.shuffle(codes)
+    probe = codes[:max_probe]
+    with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, max(1, len(probe)))) as ex_:
+        infos = list(ex_.map(lambda c: _stat_for(c, fetch_kline), probe))
     fallback: Optional[dict] = None
-    for code in codes[:max_probe]:
-        info = _stat_for(code, fetch_kline)
+    for info in infos:                          # 按原探测顺序消解优先级 (与串行语义一致)
         if not info or info.get("bars_count", 0) < bars_needed:
             continue
         info["limit_up_label"] = bucket_label(info.get("limit_up_bucket") or "")
@@ -395,9 +400,11 @@ def pick_tiered(bars_needed: int, exclude: Optional[List[str]] = None,
     if not codes:
         return None
     random.shuffle(codes)
+    probe = codes[:max_probe]
+    with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, max(1, len(probe)))) as ex_:
+        infos = list(ex_.map(lambda c: _stat_for(c, fetch_kline), probe))
     t1 = t2 = t3 = None
-    for code in codes[:max_probe]:
-        info = _stat_for(code, fetch_kline)
+    for info in infos:                          # 按原探测顺序消解优先级 (与串行语义一致)
         if not info or info.get("bars_count", 0) < bars_needed:
             continue
         info["limit_up_label"] = bucket_label(info.get("limit_up_bucket") or "")
@@ -407,7 +414,5 @@ def pick_tiered(bars_needed: int, exclude: Optional[List[str]] = None,
             t2 = info
         elif info.get("has_intraday") and t3 is None:
             t3 = info
-        if t1 is not None:
-            return t1
-    return t2 or t3
+    return t1 or t2 or t3
 

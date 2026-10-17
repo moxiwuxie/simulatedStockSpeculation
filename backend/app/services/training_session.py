@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, date
 from pathlib import Path
@@ -39,11 +40,50 @@ def _norm_en(df) -> List[dict]:
     return out
 
 
+# 需求101603: 日K拉取缓存 —— akshare 单只全量日K 冷取 0.8~2.0s (最多 8000+ 根),
+# 是「开始训练」接口的主要耗时来源; 加进程内 TTL 缓存 + 单飞(同 key 并发只拉一次),
+# 命中时返回浅拷贝, 避免训练会话改写缓存内的 K 线字典。
+_KLINE_TTL = 600
+_KLINE_CACHE: Dict[str, tuple] = {}
+_KLINE_LOCKS: Dict[str, threading.Lock] = {}
+_KLINE_GUARD = threading.Lock()
+
+
 def _fetch_stock_kline(code: str) -> List[dict]:
-    """A股日 K (前复权, 新浪: volume=股, 含真实 amount=元)"""
-    import akshare as ak
-    prefix = "sh" if code.startswith(("6", "9")) else "sz"
-    return _norm_en(ak.stock_zh_a_daily(symbol=f"{prefix}{code}", adjust="qfq"))
+    """A股日 K (前复权, 新浪: volume=股, 含真实 amount=元); 带 TTL 缓存 + 单飞"""
+    hit = _KLINE_CACHE.get(code)
+    if hit and time.time() - hit[0] < _KLINE_TTL:
+        return [dict(b) for b in hit[1]]
+    with _KLINE_GUARD:
+        lk = _KLINE_LOCKS.setdefault(code, threading.Lock())
+    with lk:
+        hit = _KLINE_CACHE.get(code)              # 双重检查: 等锁期间可能已被填好
+        if hit and time.time() - hit[0] < _KLINE_TTL:
+            return [dict(b) for b in hit[1]]
+        import akshare as ak
+        prefix = "sh" if code.startswith(("6", "9")) else "sz"
+        bars = _norm_en(ak.stock_zh_a_daily(symbol=f"{prefix}{code}", adjust="qfq"))
+        if bars:
+            _KLINE_CACHE[code] = (time.time(), bars)
+        return [dict(b) for b in bars]
+
+
+def warm_klines(codes: List[str], workers: int = 6) -> int:
+    """需求101603: 并发预热若干标的的日K缓存 (供后端预加载调用), 返回成功预热数"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    codes = [c for c in (codes or []) if c]
+    if not codes:
+        return 0
+
+    def _one(c: str) -> bool:
+        try:
+            return bool(_fetch_stock_kline(c))
+        except Exception:
+            return False
+
+    with ThreadPoolExecutor(max_workers=max(2, min(workers, len(codes)))) as ex:
+        return sum(1 for r in ex.map(_one, codes) if r)
 
 
 # 品类随机标的池 (start 时未指定 code 时使用) — 仅 A 股, 由注册表随机
@@ -68,6 +108,19 @@ CATEGORY_BARS_CAP = {"stock": 250, "long": 1250}
 
 # 品类默认单局根数 (前端滑块初始值)
 CATEGORY_DEFAULT_BARS = {"stock": 250, "long": 1250}
+
+# 单局最少根数 (与前端滑块下限同口径)
+MIN_BARS = 20
+
+# 指标预热日K上限: 训练窗口之前额外保留的日K (仅用于周/月/年线 MACD 的 EMA 收敛, 不展示)
+# 年线 span=240, 需 ≥26 根年K (=6240 根日K) 才能让 EMA(26)/DEA(9) 出值, 故上限放宽到
+# 单只 A 股全部日K的量级; 这些日K本就在同一次拉取中拿到, 只是多切一段、不产生额外请求。
+WARMUP_CAP = 8000
+
+# 需求101604: 「预生成会话」(点击开始训练前备好数据) 的保鲜期与缓存上限
+# 需求101605: 保鲜期 300 → 900s (用户可能在设置面板停留较久; 过期会导致开局退回冷构建)
+_PRIME_TTL = 900      # 预生成数据 15 分钟内有效 (用户改参数会立即重新预生成)
+_PRIME_MAX = 40       # 单进程最多保留的预生成会话数 (超出丢弃最旧的)
 
 
 def _augment_amount(klines: List[dict], category: str = "stock") -> List[dict]:
@@ -120,26 +173,37 @@ def build_intraday(code: str, bar: dict, prev_close: Optional[float],
 
 
 # ---------- 周期聚合 ----------
-
-def _period_key(b, period: str):
-    """抽取 K 线所属周期桶 key: week=(ISO年,周) / month=(年,月) / year=(年,) / day=None"""
-    from datetime import datetime
-    d = b.get("date")
-    if isinstance(d, str):
-        dt = datetime.strptime(d[:10], "%Y-%m-%d")
-    else:
-        dt = d
-    if period == "week":
-        iso = dt.isocalendar()
-        return (iso[0], iso[1])
-    if period == "month":
-        return (dt.year, dt.month)
-    if period == "year":
-        return (dt.year,)
-    return None
+# 周期长度固定为「交易日数」(周=5/月=20/年=240), 以训练窗口起点为锚点连续切分,
+# 不再按 ISO 自然周 / 自然月切分。原先首桶可能是 2~3 天的残周, 推进时会被补全,
+# 从而导致「一次推进出现多根 K 线变化」并且改写已展示 K 线的 OHLC。
+PERIOD_SPAN = {"day": 1, "week": 5, "month": 20, "year": 240}
 
 
-def aggregate_bars(bars: List[dict], period: str = "day") -> tuple:
+def bucket_ranges(bars: List[dict], period: str = "day",
+                  offset: int = 0) -> List[tuple]:
+    """把日K序列按「固定交易日长度」切分为区间列表 [(start, end), ...] (半开区间)
+
+    offset: 该序列在全局周期网格中的起点偏移 (0 ~ span-1)。前置背景K线按 span
+            截整后 offset=0, 保证训练首根刚好落在周期边界上 (锚点即背景首根K线)。
+    """
+    if not bars:
+        return []
+    if period == "day":
+        return [(i, i + 1) for i in range(len(bars))]
+    span = PERIOD_SPAN.get(period, 1)
+    n = len(bars)
+    off = offset % span
+    first = span - off if off else span
+    ranges: List[tuple] = []
+    i, end = 0, min(first, n)
+    while i < n:
+        ranges.append((i, end))
+        i, end = end, min(end + span, n)
+    return ranges
+
+
+def aggregate_bars(bars: List[dict], period: str = "day",
+                   offset: int = 0) -> tuple:
     """按周期聚合 dict K线, 返回 (聚合K线, 每根覆盖的日K数量)
 
     - period=day 原样返回
@@ -148,20 +212,9 @@ def aggregate_bars(bars: List[dict], period: str = "day") -> tuple:
     """
     if period == "day" or not bars:
         return list(bars), [1] * len(bars)
-    groups, order, key_of, counts = {}, [], {}, []
-    for b in bars:
-        key = _period_key(b, period)
-        idx = key_of.get(key)
-        if idx is None:
-            key_of[key] = len(order)
-            order.append(key)
-            groups[key] = []
-            counts.append(0)
-        groups[key].append(b)
-        counts[key_of[key]] += 1
-    out = []
-    for key in order:
-        g = groups[key]
+    out, counts = [], []
+    for s0, e0 in bucket_ranges(bars, period, offset):
+        g = bars[s0:e0]
         out.append({
             "date": g[-1]["date"],
             "open": g[0]["open"],
@@ -171,25 +224,8 @@ def aggregate_bars(bars: List[dict], period: str = "day") -> tuple:
             "volume": sum(x["volume"] for x in g),
             "amount": sum(x.get("amount") or 0 for x in g),
         })
+        counts.append(len(g))
     return out, counts
-
-
-def bucket_ranges(bars: List[dict], period: str = "day") -> List[tuple]:
-    """把日K序列按周期切分为区间列表 [(start, end), ...] (半开区间, end 不含)
-
-    用于「进度按交易日映射」: 周期K线的第 i 根覆盖 bars[start:end] 这段日K。
-    """
-    if not bars:
-        return []
-    if period == "day":
-        return [(i, i + 1) for i in range(len(bars))]
-    ranges, start = [], 0
-    for i in range(1, len(bars)):
-        if _period_key(bars[i], period) != _period_key(bars[i - 1], period):
-            ranges.append((start, i))
-            start = i
-    ranges.append((start, len(bars)))
-    return ranges
 
 
 # ---------- MACD (与前端 indicators.js 同口径, 供「日线算 + 周期桶采样」使用) ----------
@@ -251,7 +287,9 @@ class TrainingSession:
                  leverage: float = 1.0, strategy_id: Optional[int] = None,
                  pre_bars: Optional[List[dict]] = None, user_id: str = "default",
                  period: str = "day", code_name: str = "", user_specified: bool = False,
-                 limit_up_count: int = 0, limit_up_bucket: str = ""):
+                 limit_up_count: int = 0, limit_up_bucket: str = "",
+                 warmup_bars: Optional[List[dict]] = None,
+                 non_blind: bool = False):
         self.session_id = session_id
         self.user_id = user_id
         self.status = STATUS_ACTIVE
@@ -262,6 +300,7 @@ class TrainingSession:
         self.limit_up_count = int(limit_up_count or 0)
         self.limit_up_bucket = limit_up_bucket or ""
         self.user_specified = bool(user_specified)   # 用户指定标的: 训练中可展示名称
+        self.non_blind = bool(non_blind)             # 非双盲(指定个股+起始日期): 名称与日期均可见
         self.code_revealed = 0
         self.period = period if period in ("day", "week", "month", "year") else "day"
         # 原始日K (训练窗口) —— 进度与聚合的唯一基准
@@ -271,9 +310,20 @@ class TrainingSession:
         self._p_ranges: List[tuple] = []   # 当前周期每根K线覆盖的日K区间 [(start,end), ...]
         self.bars_total = 0
         self.bars_used = 0                 # 已决策的「周期K线」根数 (当前周期下)
-        self._recompute_progress()
-        self.pre_bars = pre_bars or []   # 训练窗口之前的历史K线 (市场背景, 日K)
+        # 训练窗口之前的历史K线: pre_bars=市场背景(展示), warmup=指标预热(仅算MACD不展示)
         self._daily_pre = list(pre_bars or [])
+        self._warmup_daily = list(warmup_bars or [])
+        # 性能优化(101701): 周期聚合/背景/MACD预热的缓存 —— 网格不变时避免重复 O(n) 计算
+        self._full_bar_cache: Dict[tuple, dict] = {}
+        self._all_bars_cache: Optional[List[dict]] = None
+        self._pre_view_cache: Dict[str, List[dict]] = {}
+        self._warm_closes_cache: Dict[str, List[float]] = {}
+        # MACD 全量结果缓存: 每个周期的「闭合收盘价序列」(预热+背景+全部训练K) 在一次会话内恒定不变,
+        # 仅切片长度随进度变化 → 按周期缓存 _macd_js 结果, 推进/切周期时只做切片。
+        self._macd_full_cache: Dict[tuple, tuple] = {}
+        self._bucket_ends: List[int] = []
+        self._recompute_progress()
+        self.pre_bars = self._pre_view()   # 背景K线按当前周期聚合 (锚点=背景首根日K)
         self.start_date = self._daily[0]["date"] if self._daily else None
         self.end_date = self._daily[-1]["date"] if self._daily else None
         self.leverage = max(1.0, float(leverage or 1.0))
@@ -291,18 +341,81 @@ class TrainingSession:
         # 条件单 (止盈/止损): 触发即操作 —— 推进时按 K 线高低价判定, 自动平仓
         self.conditionals: List[dict] = []
         self._cond_seq = 0
+        # 买入委托 (需求4): 决策在 K 线 N, 于下一根 K 线开盘价成交 (挂单模型)
+        self._pending_buy: Optional[dict] = None
+        self.last_fill: Optional[dict] = None   # 最近一次成交/失败记录 (前端买点与提示)
+        # T+1: 当日买入的开多数量被锁定, 当日不可卖出, 下一交易日推进后解锁
+        self._locked_qty = 0
+
+    @property
+    def pending_buy(self) -> Optional[dict]:
+        """待成交买入委托 (对外只读视图, 与 summary()['pending_buy'] 同源)"""
+        return dict(self._pending_buy) if self._pending_buy else None
 
     # ---------- 周期视图 (进度按交易日映射, 不提前展示未走到的行情) ----------
+    def _pre_daily_view(self) -> List[dict]:
+        """背景日K按当前周期截整: 取最近的 span 整数倍根
+
+        使周期网格在「训练首根」处刚好对齐 (锚点即背景首根日K), 训练段与背景段
+        的周期K线首尾相接、互不跨桶。
+        """
+        pre = self._daily_pre
+        if self.period == "day" or not pre:
+            return list(pre)
+        span = PERIOD_SPAN.get(self.period, 1)
+        k = len(pre) - (len(pre) % span)
+        return list(pre[len(pre) - k:]) if k else list(pre)
+
+    def _pre_view(self) -> List[dict]:
+        """背景K线的周期聚合序列 (与训练段同一网格锚点)
+
+        性能优化(101701): 结果只依赖周期与 _daily_pre, 按周期缓存 (推进时不变)。
+        """
+        hit = self._pre_view_cache.get(self.period)
+        if hit is not None:
+            return list(hit)
+        daily = self._pre_daily_view()
+        out = daily if self.period == "day" else aggregate_bars(daily, self.period)[0]
+        self._pre_view_cache[self.period] = out
+        return list(out)
+
     def _recompute_progress(self):
-        """按当前周期重算每根K线覆盖的日K区间, 以及「已走完的周期根数」"""
-        self._p_ranges = bucket_ranges(self._daily, self.period)
+        """按当前周期重算每根K线覆盖的日K区间 (仅周期/网格变化时调用)
+
+        性能优化(101701): 周期网格只随「切换周期」变化, 推进一根K线并不改变网格。
+        因此把「重建网格」与「更新已走完根数」拆开: 推进时只走 _update_progress,
+        网格与聚合缓存 (_full_bar_cache / _all_bars_cache) 得以跨推进复用,
+        消除长周期(1250根)下 _full_bar 的 O(n²) 重复聚合。
+        """
+        off = 0
+        if self.period != "day":
+            off = len(self._pre_daily_view()) % PERIOD_SPAN.get(self.period, 1)
+        self._p_ranges = bucket_ranges(self._daily, self.period, offset=off)
         self.bars_total = len(self._p_ranges)
-        self.bars_used = sum(1 for _s, e in self._p_ranges if e <= self.days_used)
+        self._bucket_ends = [e for _s, e in self._p_ranges]   # 升序, 供二分
+        # 网格变化 → 失效聚合缓存 (背景/MACD预热缓存不依赖训练网格, 保留)
+        self._full_bar_cache = {}
+        self._all_bars_cache = None
+        self._update_progress()
+
+    def _update_progress(self):
+        """仅更新「已走完的周期根数」(网格不变, 推进时调用)"""
+        import bisect
+        self.bars_used = bisect.bisect_right(self._bucket_ends, self.days_used)
 
     def _full_bar(self, s0: int, e0: int) -> dict:
-        """把 _daily[s0:e0] 聚合为一根周期K线"""
+        """把 _daily[s0:e0] 聚合为一根周期K线 (结果按区间缓存)
+
+        性能优化(101701): 同一区间在一次会话内会被 _visible_bars/_all_bars/
+        current_bar/summary/period_macd 反复读取, 改为按 (s0, e0) 记忆化。
+        返回浅拷贝, 避免调用方改写缓存对象。
+        """
+        key = (s0, e0)
+        hit = self._full_bar_cache.get(key)
+        if hit is not None:
+            return dict(hit)
         g = self._daily[s0:e0]
-        return {
+        bar = {
             "date": g[-1]["date"],
             "open": g[0]["open"],
             "high": max(x["high"] for x in g),
@@ -311,27 +424,35 @@ class TrainingSession:
             "volume": sum(x["volume"] for x in g),
             "amount": sum(x.get("amount") or 0 for x in g),
         }
+        self._full_bar_cache[key] = bar
+        return dict(bar)
 
     def _visible_bars(self) -> List[dict]:
-        """可见K线 = 已完整走完的周期 + 当前「部分」周期
+        """可见K线 = 「已完整走完」的周期桶 + 「当前正在形成」的部分周期桶
 
-        当前周期K线只聚合「已走过 + 当前交易日」的日K, 绝不提前用未来的交易日聚合,
-        否则切到周线会立刻显示一整周的K线 (信息泄漏)。
+        需求101606: 周期切换时 K线计算必须与「已走到的交易日」一致。
+        例: 日线推进到第2天(已显示 day1/day2)时切周线, 周K仅按 day1+day2 聚合,
+        不提前把 day1~day5 整周算作一根周K。因此在「已完成桶」之后追加
+        「当前部分周期桶」(_daily[s0:days_used+1]); 日线 span=1, 该桶即当前交易日。
         """
-        out: List[dict] = []
-        for s0, e0 in self._p_ranges:
-            if e0 <= self.days_used:
-                out.append(self._full_bar(s0, e0))
-            else:
-                cut = min(e0, self.days_used + 1)
-                if cut > s0:
-                    out.append(self._full_bar(s0, cut))
-                break
+        out: List[dict] = [self._full_bar(s0, e0)
+                           for s0, e0 in self._p_ranges if e0 <= self.days_used]
+        # 当前部分周期桶: bars_used 恰好指向「首个未走完的桶」(桶区间连续)
+        if self.days_used < self.days_total and self.bars_used < len(self._p_ranges):
+            s0, e0 = self._p_ranges[self.bars_used]
+            cut = min(e0, self.days_used + 1)
+            if cut > s0:
+                out.append(self._full_bar(s0, cut))
         return out
 
     def _all_bars(self) -> List[dict]:
-        """完整周期的全部K线 (仅结算揭晓后展示)"""
-        return [self._full_bar(s0, e0) for s0, e0 in self._p_ranges]
+        """完整周期的全部K线 (仅结算揭晓后展示)
+
+        性能优化(101701): 完整周期K线在一次会话内不变, 结果按网格缓存。
+        """
+        if self._all_bars_cache is None:
+            self._all_bars_cache = [self._full_bar(s0, e0) for s0, e0 in self._p_ranges]
+        return list(self._all_bars_cache)
 
     def _display_bars(self) -> List[dict]:
         """当前对外展示的K线: 揭晓后为完整K线, 否则为「已走完 + 当前部分周期」
@@ -347,51 +468,42 @@ class TrainingSession:
         return self._visible_bars()
 
     def period_macd(self, fast: int = 12, slow: int = 26, signal: int = 9) -> dict:
-        """周期视图 MACD: 在「日线」上算 MACD, 再按周期桶取桶末值采样
+        """周期视图 MACD: 直接在「周期K线序列」上独立计算 (不再由日线采样)
 
-        周/月/年线若直接对聚合序列算 MACD, 周期根数远少于 EMA(26)+DEA(9) 的预热需求,
-        会导致大量 null (年线几乎全空)。这里改为在完整日线上计算, 再按与 bars 一致的
-        周期切片采样, 保证与日线同口径且无空洞。
+        - 日线: 在 (背景日K + 训练日K) 上计算, 与前端 indicators.js 同口径
+        - 周/月/年线: 在 (预热周期 + 背景周期 + 训练周期) 的收盘价上独立计算 MACD,
+          预热段仅用于让 EMA(26)/DEA(9) 收敛、不展示。MACD 是因果指标(只依赖过去),
+          因此用完整序列计算后再切片, 与只用可见前缀计算的结果完全一致。
 
-        返回与前端合并序列 (pre_bars + bars) 一一对齐的 {dif, dea, hist}。
+        返回与前端合并序列 (pre_bars + 可见 bars) 一一对齐的 {dif, dea, hist}。
         """
-        pre_daily = self._daily_pre or []
-        closes = [b.get("close") for b in pre_daily] + [b.get("close") for b in (self._daily or [])]
-        if not closes:
-            return {"dif": [], "dea": [], "hist": []}
-        dif, dea, hist = _macd_js(closes, fast, slow, signal)
-        pre_off = len(pre_daily)
-
-        def sample(daily_idx: int):
-            li = pre_off + daily_idx
-            if 0 <= li < len(closes):
-                return dif[li], dea[li], hist[li]
-            return None, None, None
-
-        out = {"dif": [], "dea": [], "hist": []}
-
-        def push(d, e, h):
-            out["dif"].append(d)
-            out["dea"].append(e)
-            out["hist"].append(h)
-
-        # 1) 前置背景段 (与 pre_bars 同一套周期分桶)
-        for _s0, e0 in bucket_ranges(pre_daily, self.period):
-            push(*sample(e0 - 1))
-        # 2) 训练段: 与 _display_bars() 完全一致的切片逻辑
-        if self.code_revealed:
-            for _s0, e0 in self._p_ranges:
-                push(*sample(e0 - 1))
-        else:
-            for s0, e0 in self._p_ranges:
-                if e0 <= self.days_used:
-                    push(*sample(e0 - 1))
-                else:
-                    cut = min(e0, self.days_used + 1)
-                    if cut > s0:
-                        push(*sample(cut - 1))
-                    break
-        return out
+        disp = self._display_bars()
+        # 性能优化(101701): 每个周期的收盘价序列(预热+背景+全部训练K)在一次会话内恒定,
+        # 因此 _macd_js 全量结果可缓存, 推进/切周期时只做切片 —— 消除每步重复计算 MACD 的开销。
+        key = (self.period, fast, slow, signal)
+        full = self._macd_full_cache.get(key)
+        if full is None:
+            if self.period == "day":
+                pre_closes = [b.get("close") for b in (self._daily_pre or [])]
+                closes = pre_closes + [b.get("close") for b in (self._daily or [])]
+                base = 0
+            else:
+                # 周期序列 = 预热(仅EMA) + 背景 + 训练(完整周期)
+                warm = self._warmup_daily or []
+                warm_closes = self._warm_closes_cache.get(self.period)
+                if warm_closes is None:
+                    warm_closes = [b.get("close") for b in (aggregate_bars(warm, self.period)[0] if warm else [])]
+                    self._warm_closes_cache[self.period] = warm_closes
+                pre_closes = [b.get("close") for b in self._pre_view()]
+                train_closes = [b.get("close") for b in self._all_bars()]
+                closes = warm_closes + pre_closes + train_closes
+                base = len(warm_closes)
+            computed = _macd_js(closes, fast, slow, signal) if closes else ([], [], [])
+            full = (computed[0], computed[1], computed[2], base, len(pre_closes))
+            self._macd_full_cache[key] = full
+        dif, dea, hist, base, pre_len = full
+        n = pre_len + len(disp)
+        return {"dif": dif[base:base + n], "dea": dea[base:base + n], "hist": hist[base:base + n]}
 
     # 当前 bar 的 close_price (撮合价) —— 取「当前交易日」收盘价
     @property
@@ -400,13 +512,18 @@ class TrainingSession:
             return None
         return self._daily[self.days_used]["close"]
 
-    # 当前 bar 的 OHLC (当前周期中的部分K线)
+    # 当前「正在形成」的周期K线 OHLC (日线=当前交易日; 周/月/年=已走过部分的聚合)
     @property
     def current_bar(self) -> Optional[dict]:
-        vis = self._visible_bars()
-        if self.bars_used >= len(vis):
+        if self.days_used >= self.days_total:
             return None
-        return vis[self.bars_used]
+        if self.period == "day":
+            return self._daily[self.days_used]
+        if self.bars_used >= len(self._p_ranges):
+            return None
+        s0, e0 = self._p_ranges[self.bars_used]
+        cut = min(e0, self.days_used + 1)
+        return self._full_bar(s0, cut) if cut > s0 else None
 
     # ---------- 状态机 ----------
     def _transition(self, new_status: str):
@@ -475,15 +592,23 @@ class TrainingSession:
 
     # ---------- 决策 ----------
     def buy(self, qty: Optional[int] = None, ratio: Optional[float] = None) -> dict:
-        """开多 / 平空 (即时成交 @ 当前 close)
+        """挂出买入委托 (需求4): 决策在 K 线 N, 于下一根 K 线开盘价成交
 
         - qty 指定时按股数买入
-        - qty 为空且 ratio 给定时按「买入力 × ratio」换算手数 (仓位选择)
+        - qty 为空且 ratio 给定时按「总资产 × 杠杆 × ratio」换算手数 (仓位选择)
         - 都不传 = 满仓买入
+        实际成交发生在 advance() 走完新一根 K 线时, 以该根开盘价执行 (见 _fill_buy)。
         """
         if self.status != "active": raise ValueError("会话已结束")
-        price = self.current_price
-        if price is None: raise ValueError("无可操作 K 线")
+        if self.current_price is None: raise ValueError("无可操作 K 线")
+        self._pending_buy = {"kind": "COVER" if self.pos < 0 else "BUY",
+                             "qty": qty, "ratio": ratio, "decided_index": self.bars_used}
+        return {"action": "BUY_PENDING", "qty": int(qty or 0), "ratio": ratio,
+                "price": None, "pending": True, "decided_index": self.bars_used}
+
+    def _fill_buy(self, price: float, qty: Optional[int] = None,
+                  ratio: Optional[float] = None) -> dict:
+        """买入委托成交执行体 (价格由调用方给定: 成交根的开盘价)"""
         if self.pos < 0:
             # 平空: 返还锁定保证金 + 结算盈亏 (盈亏 = (开仓价-平仓价) × 数量)
             close_qty = min(qty or -self.pos, -self.pos)
@@ -503,11 +628,16 @@ class TrainingSession:
             ratio_val = ratio if ratio is not None else 1.0
             target_value = self.portfolio_value * self.leverage * ratio_val
             amount = min(target_value, bp)
-            qty = max(1, int(amount / price / 100) * 100 or int(amount / price))
+            # 仓位模式按「手」(100股)取整: 不足 1 手即视为买不动。
+            # 不再用 max(1, ...) 兜底强买 1 股 —— 满仓后再点买入会把可用资金打成负数。
+            qty = int(amount / price / 100) * 100
+            if qty <= 0:
+                raise ValueError("资金不足 / 仓位已满, 无法买入")
         if qty <= 0: raise ValueError("数量必须 > 0")
         cost = qty * price + self._fee(qty * price)
-        if cost > bp: qty = max(1, int(bp / (price * 1.0003)))
-        if qty <= 0: raise ValueError("资金不足")
+        if cost > bp:
+            qty = int(bp / (price * 1.0003))
+            if qty <= 0: raise ValueError("资金不足 / 仓位已满, 无法买入")
         self.cash -= qty * price + self._fee(qty * price)
         if self.pos > 0:
             # 加仓: 加权均价
@@ -515,8 +645,42 @@ class TrainingSession:
         else:
             self.avg_cost = price
         self.pos += qty
+        self._locked_qty += qty          # T+1: 当日买入锁定, 次日开盘后才可卖出
         self.trades_count += 1
         return {"action": "BUY", "qty": qty, "price": price}
+
+    # ---------- 涨停板判定 (需求3/4: 涨停板无法买入) ----------
+    @staticmethod
+    def _limit_pct(code: str) -> float:
+        """涨跌幅限制: 科创板/创业板 20%, 其余 10%"""
+        return 0.20 if str(code).startswith(("688", "300", "301")) else 0.10
+
+    def _is_limit_one_word(self, day_idx: int) -> bool:
+        """成交日(日K _daily[day_idx])是否为「缩量一字涨停板」→ 买不到
+
+        一字(open==high==low==close) 且 收盘为涨停价 且 成交量 < 前 5 日均量 × 50%,
+        三者同时满足才判定买不到; 普通涨停 / 放量一字板均可买。
+        """
+        if day_idx < 0 or day_idx >= len(self._daily):
+            return False
+        bar = self._daily[day_idx]
+        o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
+        if not (o == h == l == c):                       # 非一字
+            return False
+        if day_idx > 0:
+            prev = self._daily[day_idx - 1]["close"]
+        elif self._daily_pre:
+            prev = self._daily_pre[-1]["close"]
+        else:
+            return False
+        limit = round(prev * (1 + self._limit_pct(self.code)), 2)
+        if abs(c - limit) > 0.011:                       # 非涨停一字
+            return False
+        vols = [self._daily[i]["volume"] for i in range(max(0, day_idx - 5), day_idx)
+                if self._daily[i].get("volume")]
+        if not vols:                                     # 无历史量能 → 不判缩量
+            return False
+        return self._daily[day_idx].get("volume", 0) < (sum(vols) / len(vols)) * 0.5
 
     def sell(self, qty: Optional[int] = None, allow_short: bool = False) -> dict:
         """平多 / 开空 (即时成交 @ 当前 close)"""
@@ -524,7 +688,11 @@ class TrainingSession:
         price = self.current_price
         if price is None: raise ValueError("无可操作 K 线")
         if self.pos > 0:
-            close_qty = min(qty or self.pos, self.pos)
+            # T+1: 当日买入的部分不可卖出 (sellable = 持仓 - 当日买入锁定)
+            sellable = self.pos - self._locked_qty
+            if sellable <= 0:
+                raise ValueError("当日买入(T+1), 次日开盘后才能卖出")
+            close_qty = min(qty or sellable, sellable)
             self.cash += close_qty * price - self._fee(close_qty * price)
             self.pos -= close_qty
             pnl = (price - self.avg_cost) * close_qty
@@ -744,16 +912,23 @@ class TrainingSession:
                     hit = True; exec_price = max(op, tp)
             if not hit:
                 continue
-            operable = (c["side"] == "long" and self.pos > 0) or (c["side"] == "short" and self.pos < 0)
+            if c["side"] == "long":
+                avail = self.pos - self._locked_qty     # T+1: 当日买入不可平
+            else:
+                avail = abs(self.pos) if self.pos < 0 else 0
+            operable = avail > 0
             if not operable:
                 c["status"] = "skipped"
                 c["triggered_index"] = bar_index
                 c["triggered_date"] = bar["date"]
                 c["triggered_price"] = round(exec_price, 2)
-                c["message"] = "条件单触发, 但当前无可操作持仓, 已跳过"
+                c["message"] = ("条件单触发, 但当日买入(T+1)不可平仓, 已跳过"
+                                if c["side"] == "long" and self.pos > 0
+                                else "条件单触发, 但当前无可操作持仓, 已跳过")
                 skipped.append(dict(c))
                 continue
-            qty = max(1, int(abs(self.pos) * c["ratio"]))
+            qty = max(1, int(avail * c["ratio"]))
+            qty = min(qty, avail)
             res = self._close_at(qty, exec_price)
             if not res:
                 continue
@@ -774,6 +949,7 @@ class TrainingSession:
         if self.status != STATUS_ACTIVE: raise ValueError("会话已结束")
         if self.days_used >= self.days_total:
             return {"message": "已到最后一根, 请 settle 结算"}
+        self._locked_qty = 0        # T+1: 新的一日推进, 昨日买入解锁
         s0, e0 = self._p_ranges[self.bars_used]
         bar_idx = self.bars_used
         cut = min(e0, self.days_total)
@@ -788,13 +964,33 @@ class TrainingSession:
             "close": done["close"],
             "volume": done["volume"],
         }
+        # 需求4: 待成交买入委托在该「新走完那根K线之后」的开盘价成交
+        # (下一根周期K线的首日 = _daily[cut]; 缩量一字板 → 买不到, 委托失效)
+        fill_info = None
+        if self._pending_buy:
+            intent, self._pending_buy = self._pending_buy, None
+            if cut >= self.days_total:
+                fill_info = {"action": "BUY_FAILED", "reason": "已到最后一根K线, 委托失效",
+                             "bar_index": bar_idx + 1, "date": done["date"],
+                             "price": None, "qty": 0}
+            elif self._is_limit_one_word(cut):
+                fill_info = {"action": "BUY_FAILED", "reason": "缩量一字板, 无法买入",
+                             "bar_index": bar_idx + 1, "date": self._daily[cut]["date"],
+                             "price": None, "qty": 0}
+            else:
+                nxt = self._daily[cut]
+                r = self._fill_buy(float(nxt["open"]), intent["qty"], intent["ratio"])
+                fill_info = {"action": r["action"], "price": r["price"], "qty": r["qty"],
+                             "bar_index": bar_idx + 1, "date": nxt["date"]}
+            self.last_fill = fill_info
         self.days_used = cut
-        self._recompute_progress()
+        self._update_progress()      # 性能优化(101701): 网格未变, 仅更新已走完根数
         # 权益按「刚走完那根K线」的收盘价计, 与决策价保持一致 (最大回撤才准确)
         self.equity_curve.append(self._equity(done["close"]))
         # 条件单: 按刚走完的 K 线高低价判定, 触发即尝试操作 (有持仓则平仓, 无则提示)
         triggered, skipped = self._check_conditionals(done, bar_idx)
         result = self._bar_snapshot(prev_bar)
+        result["pending_filled"] = fill_info
         self.last_action = "HOLD"   # 新的一根 K 线, 决策重置为观望
         if triggered:
             result["triggered"] = triggered
@@ -837,6 +1033,7 @@ class TrainingSession:
 
     def _force_close(self):
         """结算时强制平仓 (多/空全部 @ 当前交易日收盘价; 已到末尾则取最后一根)"""
+        self._pending_buy = None   # 未成交委托作废
         p = self.current_price
         if p is None:
             p = self._daily[-1]["close"] if self._daily else 0.0
@@ -870,6 +1067,7 @@ class TrainingSession:
     def abort(self):
         if self.status == STATUS_ACTIVE:
             self._transition(STATUS_ABANDONED)
+        self._pending_buy = None   # 未成交委托作废
         self.code_revealed = 1
 
     def switch_period(self, period: str) -> dict:
@@ -885,14 +1083,14 @@ class TrainingSession:
             return self.summary()
         self.period = period
         self._recompute_progress()
-        # 市场背景同样按周期聚合展示 (合并绘制需同一周期)
-        self.pre_bars = list(self._daily_pre) if period == "day" else aggregate_bars(self._daily_pre, period)[0]
+        # 市场背景同样按周期聚合展示 (合并绘制需同一周期, 且与训练段同一网格锚点)
+        self.pre_bars = self._pre_view()
         return self.summary()
 
     # ---------- 对外输出 ----------
     def _intraday(self, code: str, b: dict, prev_close: Optional[float], label: str) -> dict:
         """训练分时: 优先真实 1 分钟数据, 不可得则返回空数据样式 (双盲时掩码日期)"""
-        return build_intraday(code, b, prev_close, label, bool(self.code_revealed))
+        return build_intraday(code, b, prev_close, label, bool(self.code_revealed or self.non_blind))
 
     def prebar_intraday(self, idx: int) -> dict:
         """市场背景中第 idx 根历史K线的当日分时 (真实数据, 双盲时掩码日期)"""
@@ -923,6 +1121,8 @@ class TrainingSession:
     def summary(self, hide_meta: bool = True) -> dict:
         """会话状态快照, hide_meta=True 时隐藏 code/date (双盲)"""
         price = self.current_price or (self.bars[-1]["close"] if self.bars else 0)
+        # 非双盲(需求7) 与揭晓后同样展示名称/日期; bars 仍按是否揭晓决定是否回传完整序列
+        reveal_meta = bool(self.code_revealed or not hide_meta or self.non_blind)
         out = {
             "session_id": self.session_id,
             "status": self.status,
@@ -935,9 +1135,15 @@ class TrainingSession:
             "strategy_id": self.strategy_id,
             "bars_total": self.bars_total,
             "bars_used": self.bars_used,
+            # 需求101701: 前端分时预加载缓存的版本令牌需要它 —— 周/月/年线「当前部分周期桶」
+            # 的 OHLC 随已推进交易日数变化(bars_used 可能在桶内多日不变), 用 days_used 区分。
+            "days_used": self.days_used,
+            "days_total": self.days_total,
             "initial_capital": self.initial_capital,
             "cash": round(self.cash, 2),
             "pos": self.pos,
+            "locked_qty": self._locked_qty,          # T+1: 当日买入锁定, 当日不可卖
+            "sellable_qty": max(0, self.pos - self._locked_qty) if self.pos > 0 else 0,
             "avg_cost": round(self.avg_cost, 2),
             "margin": round(-self.pos * self.avg_cost, 2) if self.pos < 0 else 0.0,
             "current_price": round(price, 2),
@@ -959,17 +1165,22 @@ class TrainingSession:
             "limit_up_label": _pool.bucket_label(self.limit_up_bucket) if _pool else "",
             # 条件单 (止盈/止损): 前端展示 active / triggered / cancelled 全量
             "conditionals": [dict(c) for c in self.conditionals],
+            # 需求4: 待成交买入委托 (挂单模型) + 最近一次成交/失败记录
+            "pending_buy": (dict(self._pending_buy) if self._pending_buy else None),
+            "last_fill": self.last_fill,
+            # 需求7: 非双盲(指定个股+起始日期) —— 名称与日期均可见
+            "non_blind": self.non_blind,
             # 双盲: 只回传「已走完 + 当前部分周期」的 K 线, 避免把未来行情泄漏到前端
             "bars": self._display_bars(),
             # 周期视图 MACD (在日线上计算后按周期桶采样, 与 bars 一一对齐; 修复周/月/年线空洞)
             "macd": self.period_macd(),
             # 市场背景: 训练窗口之前的历史K线 (双盲时日期掩码为 #N)
             "pre_count": len(self.pre_bars),
-            "pre_bars": (self.pre_bars if self.code_revealed
+            "pre_bars": (self.pre_bars if reveal_meta
                          else [{**b, "date": f"#{i + 1}"} for i, b in enumerate(self.pre_bars)]),
         }
-        if self.code_revealed or not hide_meta:
-            # 训练结束揭晓: 标的名称 + 训练时间段
+        if reveal_meta:
+            # 训练结束揭晓 / 非双盲: 标的名称 + 训练时间段
             out["code"] = self.code
             out["code_name"] = self.code_name
             out["start_date"] = self.start_date
@@ -1011,12 +1222,23 @@ class TrainingManager:
         if hasattr(self, "_initialized"): return
         self._initialized = True
         self._sessions: Dict[str, TrainingSession] = {}   # 内存活动会话
+        # 需求101604: 预生成会话缓存 (key → (ts, session)) —— 点击「开始训练」前就把
+        # 抽标/K线切片/首根分时备好, 点击时直接取用, 使 start 退化为「注册 + 落库」
+        self._primed: Dict[str, tuple] = {}
+        self._prime_lock = threading.Lock()
         self._db_path = Path(__file__).resolve().parent.parent / "data" / "training.db"
         self._db_path.parent.mkdir(exist_ok=True)
         self._init_db()
 
+    def _connect(self):
+        """打开训练库连接 (性能优化101701: WAL + synchronous=NORMAL 大幅降低每步落库的 fsync 开销)"""
+        conn = sqlite3.connect(str(self._db_path), timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
     def _init_db(self):
-        with sqlite3.connect(str(self._db_path)) as conn:
+        with self._connect() as conn:
             c = conn.cursor()
             c.execute("""CREATE TABLE IF NOT EXISTS training_sessions (
                 session_id TEXT PRIMARY KEY, status TEXT, category TEXT, code TEXT,
@@ -1060,38 +1282,137 @@ class TrainingManager:
             ):
                 if col not in cols:
                     c.execute(f"ALTER TABLE training_sessions {ddl}")
-            # 默认战法: 训练默认归属的标签 (战法只是记录标签, 删除不影响记录)
-            # 迁移: 旧「默认」战法改名为「副本」(「默认」一词保留给未归类展示)
+            # 迁移: 旧「默认」战法改名为「副本」
+            # 注意: 不再自动创建/绑定「副本」——训练未指定战法时 strategy_id 保持 NULL,
+            # 界面按「默认(未归类)」展示, 避免战法库凭空冒出一个用户没建过的战法。
             c.execute("UPDATE strategies SET name='副本' WHERE name='默认'")
-            c.execute("INSERT OR IGNORE INTO strategies (name, description, color, created_at) VALUES (?,?,?,?)",
-                      ("副本", "系统默认战法", "#00b5ff", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
             # 收益曲线重置记录: 每个账号一行, 记录重置次数与最近一次重置时间
             c.execute("""CREATE TABLE IF NOT EXISTS review_resets (
                 user_id TEXT PRIMARY KEY, reset_count INTEGER DEFAULT 0, last_reset_at TEXT
             )""")
+            # 收益曲线重置锚点明细: 每次重置留一条记录, 曲线「保留历史 + 收益率归 0」靠它定位
+            c.execute("""CREATE TABLE IF NOT EXISTS review_reset_log (
+                user_id TEXT, seq INTEGER, reset_at TEXT, PRIMARY KEY (user_id, seq)
+            )""")
+            # 训练划线数据: 按会话持久化, 供复盘历史对局回放时同步渲染 (需求3)
+            c.execute("""CREATE TABLE IF NOT EXISTS training_annos (
+                session_id TEXT PRIMARY KEY, payload TEXT, updated_at TEXT
+            )""")
             conn.commit()
 
     # ---------- 启动 ----------
+    @staticmethod
+    def _norm_args(category: str, bars_count: int, code: Optional[str],
+                   initial_capital: float, leverage: Optional[float]) -> tuple:
+        """归一化开局参数 (start/prime 共用, 保证两边缓存键一致)
+
+        注意: code 保持原值 (None 表示随机抽标), 不做 None→"" 转换 —— 构建路径依赖
+        ``code is None`` 判定是否随机抽取。
+        """
+        if category not in CATEGORY_FETCHERS:
+            raise ValueError(f"未知品类 {category}, 支持 {list(CATEGORY_FETCHERS.keys())}")
+        bars_count = min(max(bars_count, MIN_BARS), CATEGORY_BARS_CAP.get(category, 250))
+        if leverage is None:
+            leverage = CATEGORY_LEVERAGE.get(category, 1.0)
+        return bars_count, code, float(initial_capital), float(leverage)
+
+    def _prime_key(self, category: str, bars_count: int, code: Optional[str],
+                   initial_capital: float, leverage: Optional[float],
+                   strategy_id: Optional[int], user_id: str, period: str,
+                   start_date: Optional[str]) -> str:
+        """预生成会话的缓存键 (同参数即可复用同一份预生成数据)"""
+        bn, cd, cap, lev = self._norm_args(category, bars_count, code, initial_capital, leverage)
+        return json.dumps([category, bn, (cd or ""), cap, lev, strategy_id,
+                           user_id or "default", period or "day", (start_date or "")],
+                          sort_keys=True)
+
+    def _take_primed(self, key: str) -> Optional[TrainingSession]:
+        """取用预生成会话 (超过保鲜期即丢弃)"""
+        with self._prime_lock:
+            hit = self._primed.pop(key, None)
+        if not hit:
+            return None
+        ts, session = hit
+        if time.time() - ts > _PRIME_TTL:
+            return None
+        return session
+
+    def prime(self, category: str, bars_count: int = 100,
+              code: Optional[str] = None, initial_capital: float = 100_000.0,
+              leverage: Optional[float] = None, strategy_id: Optional[int] = None,
+              user_id: str = "default", period: str = "day",
+              limit_up_weights: Optional[List[float]] = None,
+              start_date: Optional[str] = None) -> Optional[TrainingSession]:
+        """需求101604: 预生成一局训练「备用」, 点击开始训练时直接取用
+
+        与 start() 走同一构建路径, 但 **不注册活动会话、不写库** —— 未被消费的预生成
+        数据随 TTL/上限自然淘汰, 不会污染训练历史。返回 None 表示预生成失败 (不影响 start)。
+        """
+        key = self._prime_key(category, bars_count, code, initial_capital, leverage,
+                              strategy_id, user_id, period, start_date)
+        with self._prime_lock:                       # 同参数已在预热中 → 直接复用
+            hit = self._primed.get(key)
+        if hit and time.time() - hit[0] <= _PRIME_TTL:
+            return hit[1]
+        try:
+            session = self._build(category, bars_count=bars_count, code=code,
+                                  initial_capital=initial_capital, leverage=leverage,
+                                  strategy_id=strategy_id, user_id=user_id, period=period,
+                                  limit_up_weights=limit_up_weights, start_date=start_date)
+        except Exception as e:
+            print(f"[Training] 预生成失败 {category}: {e}")
+            return None
+        try:                                          # 预热首根 K 线的当日分时
+            session.bar_intraday(0)
+        except Exception:
+            pass
+        with self._prime_lock:
+            self._primed[key] = (time.time(), session)
+            if len(self._primed) > _PRIME_MAX:        # 超上限: 丢弃最旧的一条
+                oldest = min(self._primed, key=lambda k: self._primed[k][0])
+                self._primed.pop(oldest, None)
+        return session
+
     def start(self, category: str, bars_count: int = 100,
               code: Optional[str] = None, initial_capital: float = 100_000.0,
               leverage: Optional[float] = None, strategy_id: Optional[int] = None,
               user_id: str = "default", period: str = "day",
-              limit_up_weights: Optional[List[float]] = None) -> TrainingSession:
-        """
+              limit_up_weights: Optional[List[float]] = None,
+              start_date: Optional[str] = None) -> TrainingSession:
+        """开始一局训练 —— 优先取用预生成会话 (需求101604), 未命中才现场构建
+
         code=None → 随机挑一只符合品类的标的, 从全量 K 线末尾切 bars_count 根
         code 有值 → 用指定 code 的全量 K 线末尾切 bars_count 根
+        code + start_date → 非双盲训练: 从 start_date 起切 bars_count 根 (名称与日期可见);
+                            起始日期之后不足 bars_count 时按可用根数收缩 (最少 MIN_BARS 根)
 
         limit_up_weights: 随机抽标的时的「涨停次数档位权重」(无/低/中/高, 长度4),
                           缺省等权; 仅 code=None 时生效
         """
-        if category not in CATEGORY_FETCHERS:
-            raise ValueError(f"未知品类 {category}, 支持 {list(CATEGORY_FETCHERS.keys())}")
-        bars_count = min(max(bars_count, 20), CATEGORY_BARS_CAP.get(category, 250))
-        if leverage is None:
-            leverage = CATEGORY_LEVERAGE.get(category, 1.0)
+        key = self._prime_key(category, bars_count, code, initial_capital, leverage,
+                              strategy_id, user_id, period, start_date)
+        session = self._take_primed(key)
+        if session is None:
+            session = self._build(category, bars_count=bars_count, code=code,
+                                  initial_capital=initial_capital, leverage=leverage,
+                                  strategy_id=strategy_id, user_id=user_id, period=period,
+                                  limit_up_weights=limit_up_weights, start_date=start_date)
+        self._sessions[session.session_id] = session
+        # 立即存一份骨架
+        self._persist_session(session)
+        return session
+
+    def _build(self, category: str, bars_count: int = 100,
+               code: Optional[str] = None, initial_capital: float = 100_000.0,
+               leverage: Optional[float] = None, strategy_id: Optional[int] = None,
+               user_id: str = "default", period: str = "day",
+               limit_up_weights: Optional[List[float]] = None,
+               start_date: Optional[str] = None) -> TrainingSession:
+        """纯构建一局训练会话 (抽标 → 切窗 → 组装), 不注册活动会话、不写库"""
+        bars_count, code, initial_capital, leverage = self._norm_args(
+            category, bars_count, code, initial_capital, leverage)
         user_specified = bool(code)          # 用户指定标的 (训练中可展示名称)
-        if strategy_id is None:              # 默认归属「默认」战法
-            strategy_id = self.default_strategy_id()
+        # strategy_id 保持 None 时不绑定任何战法 → 复盘/统计按「默认(未归类)」归集
 
         fetcher = CATEGORY_FETCHERS[category]
         lu_count, lu_bucket = 0, ""
@@ -1115,16 +1436,39 @@ class TrainingManager:
                     f"未找到历史足够长的标的 (至少需 {bars_count + 30} 条日K), 请重试或指定标的")
         else:
             klines = _augment_amount(fetcher(code), category)
-            if len(klines) < bars_count + 30:
+            # 指定起始日期时窗口由 start_date 决定, 不要求尾部再留 30 根背景
+            if not start_date and len(klines) < bars_count + 30:
                 raise ValueError(f"{code} K线只有 {len(klines)} 条, 不够训练")
-        # 随机起始窗口: 在全历史中随机切一段 (开头保留 ≥30 根市场背景, 末尾留足训练根数)
-        import random as _rnd
-        start_idx = _rnd.randint(30, len(klines) - bars_count)
+        # 起始窗口: 指定起始日期(非双盲) 或 随机切一段 (开头保留 ≥30 根市场背景, 末尾留足训练根数)
+        non_blind = False
+        if code is not None and start_date:
+            sd = str(start_date)[:10]
+            try:
+                datetime.strptime(sd, "%Y-%m-%d")
+            except ValueError:
+                raise ValueError("起始日期格式须为 YYYY-MM-DD")
+            idx = next((i for i, k in enumerate(klines) if str(k["date"])[:10] >= sd), None)
+            if idx is None:
+                raise ValueError(f"起始日期 {sd} 晚于该标的全部K线, 请调整日期")
+            available = len(klines) - idx          # 起始日期之后实际可用根数
+            if available < MIN_BARS:
+                raise ValueError(
+                    f"起始日期 {sd} 之后仅 {available} 根K线, 不足单局最少 {MIN_BARS} 根, 请调整日期或改选标的")
+            bars_count = min(bars_count, available)   # 自动收缩训练窗口, 不再直接报错
+            start_idx = idx
+            non_blind = True
+        else:
+            import random as _rnd
+            start_idx = _rnd.randint(30, len(klines) - bars_count)
         bars = klines[start_idx:][:bars_count]
 
         # 市场背景: 训练窗口之前的近 250 根历史K线 (双盲时显示掩码日期)
         pre_count = min(250, start_idx)
-        pre_bars = _augment_amount(klines[max(0, start_idx - pre_count):start_idx], category)
+        pre_start = max(0, start_idx - pre_count)
+        pre_bars = _augment_amount(klines[pre_start:start_idx], category)
+        # 指标预热: 背景之前再多留一段日K (仅用于周/月/年线 MACD 的 EMA 收敛, 不展示)
+        warm_count = min(WARMUP_CAP, pre_start)
+        warmup_bars = _augment_amount(klines[pre_start - warm_count:pre_start], category) if warm_count else []
 
         session_id = str(uuid.uuid4())[:12]
         session = TrainingSession(session_id, category, code, bars, initial_capital,
@@ -1132,10 +1476,8 @@ class TrainingManager:
                                   user_id=user_id, period=period,
                                   code_name=self._resolve_code_name(code),
                                   user_specified=user_specified,
-                                  limit_up_count=lu_count, limit_up_bucket=lu_bucket)
-        self._sessions[session_id] = session
-        # 立即存一份骨架
-        self._persist_session(session)
+                                  limit_up_count=lu_count, limit_up_bucket=lu_bucket,
+                                  warmup_bars=warmup_bars, non_blind=non_blind)
         return session
 
     def _pick_random_code(self, bars_needed: int = 0,
@@ -1233,11 +1575,7 @@ class TrainingManager:
             pass
         return ""
 
-    def default_strategy_id(self) -> Optional[int]:
-        """「副本」战法的 id (用于训练默认归属)"""
-        with sqlite3.connect(str(self._db_path)) as conn:
-            row = conn.execute("SELECT id FROM strategies WHERE name='副本'").fetchone()
-        return row[0] if row else None
+    
 
     # ---------- 动作 ----------
     def get(self, session_id: str) -> Optional[TrainingSession]:
@@ -1245,8 +1583,9 @@ class TrainingManager:
 
     def buy(self, session_id: str, qty: Optional[int] = None,
             ratio: Optional[float] = None) -> TrainingSession:
+        """挂出买入委托 (需求4): 决策根不落库, 待 advance 于次日开盘成交后回写成交根"""
         s = self.get(session_id); assert s is not None
-        s.buy(qty, ratio); s.last_action = "BUY"; self._persist_bar(s); self._persist_session(s); return s
+        s.buy(qty, ratio); self._persist_session(s); return s
 
     def sell(self, session_id: str, qty: Optional[int] = None, allow_short: bool = False) -> TrainingSession:
         s = self.get(session_id); assert s is not None
@@ -1254,7 +1593,27 @@ class TrainingManager:
 
     def hold(self, session_id: str) -> TrainingSession:
         s = self.get(session_id); assert s is not None
-        s.hold(); s.last_action = "HOLD"; self._persist_bar(s); self._persist_session(s); return s
+        s.hold(); s.last_action = "HOLD"
+        # 性能优化(101701): bar 快照 + 会话行合并为一次事务
+        conn = self._connect()
+        try:
+            self._persist_bar(s, conn=conn)
+            self._persist_session(s, conn=conn)
+            conn.commit()
+        finally:
+            conn.close()
+        return s
+
+    def hold_and_advance(self, session_id: str) -> dict:
+        """观望并立即推进一根K线 (合并 hold + advance)
+
+        性能优化(101701): 前端「观望」原先串行发 hold→advance 两次请求, 且同一根K
+        的决策快照会被两次落库。合并后只需一次请求、一次落库, 返回与 advance 同结构。
+        """
+        s = self.get(session_id); assert s is not None
+        s.hold()                      # 校验会话可决策 (终态直接抛错)
+        s.last_action = "HOLD"
+        return self.advance(session_id)
 
     def set_conditional(self, session_id: str, kind: str,
                         trigger_price: Optional[float] = None, ratio: float = 1.0,
@@ -1272,18 +1631,30 @@ class TrainingManager:
         return c
 
     def advance(self, session_id: str) -> dict:
-        """推进一根 K, 同时决定 auto-settle / 条件单触发"""
+        """推进一根 K, 同时决定 auto-settle / 条件单触发 / 买入委托成交"""
         s = self.get(session_id); assert s is not None
-        self._persist_bar(s)          # 落库当前这根 K 的决策 (含纯观望), 保证权益曲线完整
-        result = s.advance()
-        # 条件单触发 → 用触发动作(TP/SL)覆盖该根 K 的快照, 保证复盘与内存一致
-        if result.get("triggered"):
-            self._persist_bar(s, action=result["last_action"], bar_index=result["bar_index"])
-        self._persist_session(s)
-        if s.status in TERMINAL_STATUSES:   # settled / blown_up 均归档
-            self._finalize_session(s)
+        # 性能优化(101701): 一次连接一次提交完成本步全部落库 (原先 2~3 次 connect+commit)
+        conn = self._connect()
+        try:
+            self._persist_bar(s, conn=conn)      # 落库当前这根 K 的决策 (含纯观望), 保证权益曲线完整
+            result = s.advance()
+            # 条件单触发 → 用触发动作(TP/SL)覆盖该根 K 的快照, 保证复盘与内存一致
+            if result.get("triggered"):
+                self._persist_bar(s, conn=conn, action=result["last_action"], bar_index=result["bar_index"])
+            # 买入委托于该根K线开盘价成交 → 回写成交根 (BUY/COVER + 成交价)
+            pf = result.get("pending_filled")
+            if pf and pf.get("action") in ("BUY", "COVER"):
+                self._persist_bar(s, conn=conn, action=pf["action"], bar_index=pf["bar_index"],
+                                  action_price=pf.get("price"))
+            self._persist_session(s, conn=conn)
+            if s.status in TERMINAL_STATUSES:   # settled / blown_up 均归档 (并入同一事务)
+                self._finalize_session(s, conn=conn)
+            conn.commit()
+        finally:
+            conn.close()
         return {"session": s.summary(), "auto_settled": result.get("settled", False),
                 "triggered": result.get("triggered", []),
+                "pending_filled": pf,
                 "conditions_skipped": result.get("conditions_skipped", [])}
 
     def switch_period(self, session_id: str, period: str) -> dict:
@@ -1305,8 +1676,11 @@ class TrainingManager:
         return s
 
     # ---------- 存档 ----------
-    def _persist_session(self, s: TrainingSession):
-        with sqlite3.connect(str(self._db_path)) as conn:
+    def _persist_session(self, s: TrainingSession, conn=None):
+        """写入会话行; conn 传入时复用外部连接且不提交 (供一次事务批量落库)"""
+        own = conn is None
+        conn = conn if conn is not None else self._connect()
+        try:
             c = conn.cursor()
             c.execute("""INSERT OR REPLACE INTO training_sessions
                 (session_id, status, category, code, code_revealed, start_date, end_date,
@@ -1326,33 +1700,66 @@ class TrainingManager:
                  CATEGORY_LABELS.get(s.category, s.category),
                  s.user_id, s.code_name,
                  s.limit_up_count, s.limit_up_bucket))
-            conn.commit()
+            if own:
+                conn.commit()
+        finally:
+            if own:
+                conn.close()
+
+    _TRADE_ACTIONS = ("BUY", "SELL", "COVER", "SHORT", "SHORT_ADD", "TP", "SL")
 
     def _persist_bar(self, s: TrainingSession, action: Optional[str] = None,
-                     bar_index: Optional[int] = None):
+                     bar_index: Optional[int] = None, action_price: Optional[float] = None,
+                     conn=None):
         """持久化当前 bar 的决策快照 (action 缺省取本根 K 的决策动作)
 
-        bar_index 显式指定时用于「条件单触发后回写该根 K 的实际持仓变化」。
+        bar_index 显式指定时用于「条件单触发后回写该根 K 的实际持仓变化」,
+        以及「买入委托于次日开盘成交后回写成交根」(action_price = 成交价)。
+        已落库的成交记录不会被后续的观望(HOLD)覆盖。
+        conn 传入时复用外部连接且不提交 (供一次事务批量落库)。
         """
-        vis = s.bars                              # 当前周期的可见K线 (含部分周期)
+        vis = s.bars                              # 当前周期的可见K线 (周/月/年=已走完的桶)
         idx = s.bars_used if bar_index is None else bar_index
-        if idx >= len(vis): return
+        allb = s._all_bars()
+        if idx < len(vis):
+            bar = vis[idx]
+        elif idx < len(allb):
+            # 周/月/年线: 当前桶尚未走完, 该桶不在可见序列里 → 取完整桶存档 (决策价另取实时价)
+            bar = allb[idx]
+        else:
+            return
         action = action or getattr(s, "last_action", "HOLD")
-        bar = vis[idx]
-        with sqlite3.connect(str(self._db_path)) as conn:
+        # 决策(买卖)成交价 = 决策时刻的「当前交易日」收盘价; 并未用整桶收盘价
+        price = action_price if action_price is not None else (
+            s.current_price if s.current_price is not None else bar["close"])
+        own = conn is None
+        conn = conn if conn is not None else self._connect()
+        try:
             c = conn.cursor()
+            if action == "HOLD":
+                # 该根已有成交记录(BUY/SELL/条件单) → 不用后续观望覆盖
+                row = c.execute("SELECT action FROM training_bars WHERE session_id=? AND bar_index=?",
+                                (s.session_id, idx)).fetchone()
+                if row and row[0] in self._TRADE_ACTIONS:
+                    return
             c.execute("""INSERT OR REPLACE INTO training_bars
                 (session_id, bar_index, date, open, high, low, close, volume,
                  action, action_price, pos_before, cash_before, pnl_before,
                  pos_after, cash_after, pnl_after, equity)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (s.session_id, idx, bar["date"], bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"],
-                 action, bar["close"], s.pos, s.cash, s.pnl, s.pos, s.cash, s.pnl,
-                 round(s._equity(bar["close"]), 2)))
-            conn.commit()
+                 action, price, s.pos, s.cash, s.pnl, s.pos, s.cash, s.pnl,
+                 round(s._equity(price), 2)))
+            if own:
+                conn.commit()
+        finally:
+            if own:
+                conn.close()
 
-    def _finalize_session(self, s: TrainingSession):
-        with sqlite3.connect(str(self._db_path)) as conn:
+    def _finalize_session(self, s: TrainingSession, conn=None):
+        own = conn is None
+        conn = conn if conn is not None else self._connect()
+        try:
             c = conn.cursor()
             final_pnl_pct = round(s.pnl_pct, 2)
             final_win_rate = round(s.win_count / s.round_trips * 100, 1) if s.round_trips else 0
@@ -1366,9 +1773,39 @@ class TrainingManager:
                  CATEGORY_LABELS.get(s.category, s.category),
                  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                  json.dumps(s.summary(hide_meta=False), ensure_ascii=False), s.session_id))
-            conn.commit()
+            if own:
+                conn.commit()
+        finally:
+            if own:
+                conn.close()
         # 从内存移除 (已 settle/abandoned)
         self._sessions.pop(s.session_id, None)
+
+    # ---------- 训练划线 (需求3: 持久化, 供复盘历史对局同步) ----------
+    def save_annos(self, session_id: str, payload) -> int:
+        """保存某会话的划线数据 (整体覆盖; payload 为划线数组)"""
+        data = payload if isinstance(payload, list) else []
+        with sqlite3.connect(str(self._db_path)) as conn:
+            conn.execute("""INSERT OR REPLACE INTO training_annos (session_id, payload, updated_at)
+                            VALUES (?,?,?)""",
+                         (session_id, json.dumps(data, ensure_ascii=False),
+                          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            conn.commit()
+        return len(data)
+
+    def get_annos(self, session_id: str) -> List[dict]:
+        """读取某会话的划线数据 (不存在返回空数组)"""
+        with sqlite3.connect(str(self._db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT payload FROM training_annos WHERE session_id=?",
+                               (session_id,)).fetchone()
+        if not row or not row["payload"]:
+            return []
+        try:
+            data = json.loads(row["payload"])
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
 
     # ---------- 历史 ----------
     def list_history(self, limit: int = 50, user_id: Optional[str] = None) -> List[dict]:
@@ -1413,27 +1850,44 @@ class TrainingManager:
             return {"reset_count": row["reset_count"] or 0, "last_reset_at": row["last_reset_at"] or ""}
         return {"reset_count": 0, "last_reset_at": ""}
 
-    def equity_nav(self, user_id: str = "default") -> dict:
-        """账号收益曲线: 净值比例复利加权 (基准100), 仅统计「最近一次重置之后」的结算局
+    def _reset_points(self, conn, user_id: str) -> List[str]:
+        """该账号的全部重置时间点 (按重置先后正序)"""
+        rows = conn.execute("SELECT reset_at FROM review_reset_log WHERE user_id=? ORDER BY seq",
+                            (user_id,)).fetchall()
+        return [r["reset_at"] for r in rows if r["reset_at"]]
 
-        nav <= 0 (出现 -100% 爆仓) 时 can_start=False, 训练入口据此拦截。
+    @staticmethod
+    def _anchor(reset_at: str, label: str) -> dict:
+        """曲线锚点: 净值 100 / 收益率 0% (起点 或 一次重置)"""
+        return {"session_id": None, "created_at": reset_at, "code": "", "code_name": "",
+                "pnl_pct": 0.0, "nav": 100.0, "is_reset": True, "label": label}
+
+    def equity_nav(self, user_id: str = "default") -> dict:
+        """账号收益曲线: 净值比例复利加权 (基准100)
+
+        - 曲线完整保留历史: 首部固定「起点」锚点(100/0%), 每次重置再插入一个「重置」锚点(100/0%),
+          即「重置只把收益率归 0, 不清理之前的曲线数据」
+        - nav = 最近一次重置锚点之后的复利净值; nav <= 0 (出现 -100% 爆仓) 时 can_start=False
         """
         with sqlite3.connect(str(self._db_path)) as conn:
             conn.row_factory = sqlite3.Row
             st = self._reset_state(conn, user_id)
-            where = ("WHERE s.status IN ('settled','blown_up') "
-                     "AND s.user_id=? AND s.pnl_pct IS NOT NULL")
-            params: list = [user_id]
-            if st["last_reset_at"]:
-                where += " AND s.created_at > ?"
-                params.append(st["last_reset_at"])
+            resets = self._reset_points(conn, user_id)
             rows = conn.execute(
-                f"""SELECT session_id, code, code_name, category, created_at, pnl_pct
-                    FROM training_sessions s {where} ORDER BY s.created_at ASC""",
-                params).fetchall()
+                """SELECT session_id, code, code_name, category, created_at, pnl_pct
+                   FROM training_sessions s
+                   WHERE s.status IN ('settled','blown_up') AND s.user_id=?
+                     AND s.pnl_pct IS NOT NULL
+                   ORDER BY s.created_at ASC""", (user_id,)).fetchall()
         nav = 1.0
-        curve: List[dict] = []
+        curve: List[dict] = [self._anchor("", "起点")]
+        ri = 0
         for r in rows:
+            # 该局之前发生的重置 → 先落锚点并把收益率归 0 (历史点保留在曲线上)
+            while ri < len(resets) and resets[ri] < (r["created_at"] or ""):
+                nav = 1.0
+                curve.append(self._anchor(resets[ri], f"重置#{ri + 1}"))
+                ri += 1
             nav *= (1 + (float(r["pnl_pct"]) or 0) / 100)
             if nav < 0:
                 nav = 0.0
@@ -1441,8 +1895,13 @@ class TrainingManager:
                 "session_id": r["session_id"], "created_at": r["created_at"],
                 "code": r["code"], "code_name": r["code_name"] or "",
                 "pnl_pct": round(float(r["pnl_pct"]) or 0, 2),
-                "nav": round(nav * 100, 2),
+                "nav": round(nav * 100, 2), "is_reset": False,
             })
+        # 全部记录之后发生的重置 → 落到曲线末尾 (归零后重置可立即恢复可训练)
+        while ri < len(resets):
+            nav = 1.0
+            curve.append(self._anchor(resets[ri], f"重置#{ri + 1}"))
+            ri += 1
         return {
             "nav": round(nav * 100, 2),
             "curve": curve,
@@ -1452,7 +1911,7 @@ class TrainingManager:
         }
 
     def reset_equity(self, user_id: str = "default") -> dict:
-        """重置收益曲线起点 (保留全部训练记录, 仅从当前时刻重新起算) 并累加重置次数"""
+        """重置收益曲线: 收益率归 0 (保留全部训练记录与历史曲线), 并累加重置次数"""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with sqlite3.connect(str(self._db_path)) as conn:
             conn.execute(
@@ -1460,14 +1919,20 @@ class TrainingManager:
                    ON CONFLICT(user_id) DO UPDATE SET
                      reset_count = reset_count + 1, last_reset_at = excluded.last_reset_at""",
                 (user_id, now))
+            seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM review_reset_log WHERE user_id=?",
+                               (user_id,)).fetchone()[0]
+            conn.execute("INSERT OR REPLACE INTO review_reset_log (user_id, seq, reset_at) VALUES (?,?,?)",
+                         (user_id, seq, now))
             conn.commit()
         return self.equity_nav(user_id)
 
     def get_history(self, session_id: str) -> Optional[dict]:
         """单局完整回看数据: 训练K线(含每根决策) + 训练前市场背景K线 + 权益曲线
 
-        前置背景K线来自结算快照 settlement_json (仅有结算/放弃后才有), 因此
-        进行中的会话需由调用方从内存会话补齐 (见 main.train_history_detail)。
+        训练K线以「完整序列」为基准, 再用落库的决策快照按 bar_index 覆盖:
+        - 已结算/爆仓/放弃 → 结算快照 settlement_json["bars"] (与结算瞬间展示一致)
+        - 进行中 → 内存会话的可见K线; 内存已释放时退回落库稀疏K线 (老数据兜底)
+        这样「整局没有任何操作」也能看到完整K线 (原先只返回有决策的稀疏行, 前端不渲染)。
         """
         with sqlite3.connect(str(self._db_path)) as conn:
             conn.row_factory = sqlite3.Row
@@ -1478,29 +1943,56 @@ class TrainingManager:
             sess = c.fetchone()
             if not sess: return None
             c.execute("SELECT * FROM training_bars WHERE session_id=? ORDER BY bar_index", (session_id,))
-            bars = [dict(r) for r in c.fetchall()]
+            decisions = {r["bar_index"]: dict(r) for r in c.fetchall()}
             result = dict(sess)
-            result["bars"] = bars
             result["status_label"] = STATUS_LABELS.get(result.get("status"), result.get("status"))
             if not result.get("code_name"):     # 老记录回填股票名称
                 result["code_name"] = self._resolve_code_name(result.get("code") or "")
-            # 权益曲线: 优先用落库的每根权益快照 (空头/杠杆均准确), 老数据回退旧公式
-            result["equity_curve"] = [
-                b["equity"] if b.get("equity") is not None
-                else (b["cash_after"] or 0) + (b["pos_after"] or 0) * b["close"]
-                for b in bars
-            ]
-            # 训练前市场背景K线 (来自结算快照)
-            pre_bars = []
-            raw = result.get("settlement_json")
-            if raw:
-                try:
-                    pre_bars = json.loads(raw).get("pre_bars") or []
-                except (ValueError, TypeError):
-                    pre_bars = []
-            result["pre_bars"] = pre_bars
-            result["pre_count"] = len(pre_bars)
-            return result
+        # 结算快照 (含完整K线 + 训练前背景K线)
+        snap = None
+        raw = result.get("settlement_json")
+        if raw:
+            try:
+                snap = json.loads(raw)
+            except (ValueError, TypeError):
+                snap = None
+        # 1) 完整K线基准: 结算快照 → 内存会话 → 落库稀疏行
+        base = [dict(b) for b in ((snap or {}).get("bars") or [])]
+        if not base:
+            mem = self.get(session_id)
+            if mem is not None:
+                base = [dict(b) for b in mem._display_bars()]
+        if not base:
+            base = [decisions[i] for i in sorted(decisions)]
+        # 2) 决策快照按 bar_index 覆盖 (含纯观望), 无决策的K线补 HOLD 默认值
+        bars = []
+        for i, b in enumerate(base):
+            d = decisions.get(i) or {}
+            row = dict(b)
+            row["action"] = d.get("action") or "HOLD"
+            row["action_price"] = d.get("action_price")
+            row["pos_before"] = d.get("pos_before")
+            row["cash_before"] = d.get("cash_before")
+            row["pnl_before"] = d.get("pnl_before")
+            row["pos_after"] = d.get("pos_after")
+            row["cash_after"] = d.get("cash_after")
+            row["pnl_after"] = d.get("pnl_after")
+            row["equity"] = d.get("equity")
+            bars.append(row)
+        result["bars"] = bars
+        # 权益曲线: 优先用落库的每根权益快照 (空头/杠杆均准确), 缺值回退旧公式
+        result["equity_curve"] = [
+            b["equity"] if b.get("equity") is not None
+            else (b["cash_after"] or 0) + (b["pos_after"] or 0) * b["close"]
+            for b in bars
+        ]
+        result["actions_count"] = sum(1 for b in bars if b["action"] in ("BUY", "SELL"))
+        # 训练前市场背景K线 (来自结算快照)
+        result["pre_bars"] = list((snap or {}).get("pre_bars") or [])
+        result["pre_count"] = len(result["pre_bars"])
+        # 需求3: 训练划线数据随对局同步, 复盘历史回看时一并渲染
+        result["annos"] = self.get_annos(session_id)
+        return result
 
     # ---------- 已归档会话的分时回看 (内存已释放) ----------
     def replay_series(self, session_id: str) -> Optional[dict]:
@@ -1551,7 +2043,12 @@ class TrainingManager:
     def list_strategies(self) -> List[dict]:
         with sqlite3.connect(str(self._db_path)) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute("SELECT * FROM strategies ORDER BY id").fetchall()
+            # 过滤系统遗留「副本」: 仅在它没有任何训练记录关联时隐藏 (有记录则保留标签, 不丢数据)
+            rows = conn.execute("""
+                SELECT * FROM strategies s
+                WHERE NOT (s.name='副本' AND s.description='系统默认战法'
+                           AND NOT EXISTS (SELECT 1 FROM training_sessions t WHERE t.strategy_id = s.id))
+                ORDER BY id""").fetchall()
             return [dict(r) for r in rows]
 
     def create_strategy(self, name: str, description: str = "", color: str = "#00b5ff") -> dict:
@@ -1636,7 +2133,11 @@ class TrainingManager:
 
         out = []
         for st in strategies:
-            out.append({**st, **_agg(grouped.pop(st["id"], []), st["id"])})
+            items = grouped.pop(st["id"], [])
+            # 系统遗留「副本」且无任何记录 → 不展示 (避免凭空出现一个用户没建过的战法)
+            if st["name"] == "副本" and st.get("description") == "系统默认战法" and not items:
+                continue
+            out.append({**st, **_agg(items, st["id"])})
         # 未归类 (strategy_id=NULL) → 展示为「默认」(不可删除)
         unassigned = grouped.pop(None, [])
         if unassigned:

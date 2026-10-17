@@ -7,23 +7,9 @@
   'use strict';
   const { ref, computed, nextTick, onMounted, watch } = Vue;
 
-  const API = '/api';   // 前端服务反向代理到后端 (同源)
   async function api(path, opts) {
-    const headers = { 'Content-Type': 'application/json' };
-    const token = localStorage.getItem('auth_token');
-    if (token) headers['Authorization'] = 'Bearer ' + token;   // 与训练模块同一身份, 保证记录同步
-    const res = await fetch(API + path, {
-      headers,
-      ...(opts || {}),
-    });
-    if (!res.ok) {
-      const t = await res.text();
-      let msg = t;
-      try { msg = JSON.parse(t).detail || t; } catch (e) {}
-      throw new Error(msg || ('HTTP ' + res.status));
-    }
-    const ct = res.headers.get('content-type') || '';
-    return ct.includes('json') ? res.json() : res.text();
+    // 需求101602: 统一走预加载/缓存层 (只读GET缓存 + 并发去重), 见 preload.js
+    return window.__apiFetch(path, opts);
   }
 
   function waitForSize(id, timeout) {
@@ -46,6 +32,124 @@
   function tc(name, fallback) {
     const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
     return v || fallback;
+  }
+
+  // 需求3: 复盘历史对局渲染训练划线, 与训练模块同款风格 (同花顺红 + 点状虚线)
+  const ANNO_RED = '#ff3b30';
+  const ANNO_DASH = [3, 3];
+
+  // Liang-Barsky 线段裁剪: 将线段裁剪到矩形内 (用于延长线/射线超出绘图区的部分)
+  function clipLine(p1, p2, rect) {
+    let x1 = p1[0], y1 = p1[1], x2 = p2[0], y2 = p2[1];
+    const dx = x2 - x1, dy = y2 - y1;
+    let t0 = 0, t1 = 1;
+    const p = [-dx, dx, -dy, dy];
+    const q = [x1 - rect.x, rect.x + rect.width - x1, y1 - rect.y, rect.y + rect.height - y1];
+    for (let i = 0; i < 4; i++) {
+      if (p[i] === 0) { if (q[i] < 0) return null; }
+      else {
+        const r = q[i] / p[i];
+        if (p[i] < 0) { if (r > t1) return null; if (r > t0) t0 = r; }
+        else { if (r < t0) return null; if (r < t1) t1 = r; }
+      }
+    }
+    return [[x1 + t0 * dx, y1 + t0 * dy], [x1 + t1 * dx, y1 + t1 * dy]];
+  }
+
+  /** 训练划线 overlay 系列 (水平线/矩形/箭头/射线/直线), 随缩放平移实时重绘 */
+  function buildAnnoSeries(annos, all) {
+    return {
+      name: '画线', type: 'custom', xAxisIndex: 0, yAxisIndex: 0,
+      z: 30, silent: true, animation: false,
+      // dataZoom filterMode='filter' 会过滤窗口外数据点, 故用全量索引驱动 renderItem
+      data: all.map(function (b, i) { return [i, b.close]; }),
+      renderItem: function (params, api2) {
+        const grid = params.coordSys;
+        if (!grid || !grid.width) return;
+        const rect = { x: grid.x, y: grid.y, width: grid.width, height: grid.height };
+        const children = [];
+        const toPx = function (xi, yv) {
+          const p = api2.coord([xi, yv]);
+          if (!p || isNaN(p[0]) || isNaN(p[1])) return null;
+          return p;
+        };
+        const pushLine = function (a2, b2, color, dash) {
+          if (!a2 || !b2) return;
+          const seg = clipLine(a2, b2, rect);
+          if (!seg) return;
+          const style = { stroke: color, lineWidth: 1.4 };
+          if (dash) style.lineDash = dash;
+          children.push({
+            type: 'line',
+            shape: { x1: seg[0][0], y1: seg[0][1], x2: seg[1][0], y2: seg[1][1] },
+            style: style,
+          });
+        };
+        annos.forEach(function (a) {
+          if (a.type === 'hline') {
+            const p = toPx(a.x, a.y);
+            if (!p) return;
+            children.push({
+              type: 'line',
+              shape: { x1: rect.x, y1: p[1], x2: rect.x + rect.width, y2: p[1] },
+              style: { stroke: ANNO_RED, lineWidth: 1.4 },
+            });
+          } else if (a.type === 'rect') {
+            const p1 = toPx(a.x1, a.y1), p2 = toPx(a.x2, a.y2);
+            if (!p1 || !p2) return;
+            const x = Math.max(rect.x, Math.min(p1[0], p2[0]));
+            const y = Math.max(rect.y, Math.min(p1[1], p2[1]));
+            const w = Math.min(rect.x + rect.width, Math.max(p1[0], p2[0])) - x;
+            const h = Math.min(rect.y + rect.height, Math.max(p1[1], p2[1])) - y;
+            if (w <= 0 || h <= 0) return;
+            children.push({
+              type: 'rect',
+              shape: { x: x, y: y, width: w, height: h },
+              style: { fill: 'transparent', stroke: ANNO_RED, lineWidth: 1.2, lineDash: [4, 3] },
+            });
+          } else if (a.type === 'arrow') {
+            const p1 = toPx(a.x1, a.y1), p2 = toPx(a.x2, a.y2);
+            if (!p1 || !p2) return;
+            const dx = p2[0] - p1[0], dy = p2[1] - p1[1];
+            const len = Math.sqrt(dx * dx + dy * dy);
+            if (len < 2) return;
+            const ux = dx / len, uy = dy / len;
+            const N = 8;
+            for (let k = 0; k < N; k++) {
+              const t0 = k / N, t1 = (k + 1) / N;
+              const wdt = 0.8 + (3.0 - 0.8) * t1;
+              children.push({
+                type: 'line',
+                shape: { x1: p1[0] + ux * len * t0, y1: p1[1] + uy * len * t0,
+                         x2: p1[0] + ux * len * t1, y2: p1[1] + uy * len * t1 },
+                style: { stroke: ANNO_RED, lineWidth: wdt },
+              });
+            }
+            const hw = 9, hl = 12;
+            const bx = p2[0] - ux * hl, by = p2[1] - uy * hl;
+            const px = -uy, py = ux;
+            children.push({
+              type: 'polygon',
+              shape: { points: [[p2[0], p2[1]], [bx + px * hw, by + py * hw], [bx - px * hw, by - py * hw]] },
+              style: { fill: ANNO_RED },
+            });
+          } else {
+            const p1 = toPx(a.x1, a.y1), p2 = toPx(a.x2, a.y2);
+            if (!p1 || !p2) return;
+            const dx = p2[0] - p1[0], dy = p2[1] - p1[1];
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            const ux = dx / len, uy = dy / len;
+            const FAR = 6000;
+            if (a.type === 'ray') {
+              pushLine(p1, [p1[0] + ux * FAR, p1[1] + uy * FAR], ANNO_RED, ANNO_DASH);
+            } else {
+              pushLine([p1[0] - ux * FAR, p1[1] - uy * FAR], [p1[0] + ux * FAR, p1[1] + uy * FAR], ANNO_RED, ANNO_DASH);
+            }
+          }
+        });
+        return { type: 'group', children: children };
+      },
+    };
   }
 
   window.ReviewPane = {
@@ -179,6 +283,9 @@
           <div><span>最大回撤</span><b class="down">{{ current.max_drawdown }}%</b></div>
           <div><span>杠杆</span><b>{{ current.leverage }}x</b></div>
         </div>
+        <div v-if="subTab === 'train' && !current.actions_count" class="rv-empty">
+          本局没有买卖操作，仅展示K线走势（未操作的对局也会完整保留K线记录）
+        </div>
         <div class="detail-edit">
           <select v-model="editStrategy">
             <option :value="null">默认</option>
@@ -244,7 +351,6 @@
           <option v-for="s in strategies" :key="s.id" :value="s.id">{{ s.name }}</option>
         </select>
         <select v-model="attrCategory" class="mini-select">
-          <option value="">全部品类</option>
           <option value="stock">股票双盲</option>
           <option value="long">长周期训练</option>
         </select>
@@ -385,7 +491,7 @@
       const attrib = ref(null);
       const attrLoading = ref(false);
       const attrStrategy = ref(undefined);
-      const attrCategory = ref('');
+      const attrCategory = ref('stock');     // 需求101506-5: 删除「全部品类」, 默认股票双盲
       const subTab = ref('train');          // 'train' 训练复盘 | 'live' 模拟交易复盘
       const tiers = ref([]);                 // 资金体系档位 (模拟交易复盘用)
       const liveTier = ref('');              // 当前体系 key
@@ -593,7 +699,10 @@
           // 重置后仅有重置之后的结算局; 若尚无新局则为空曲线 (仅显示基准 100 虚线)
           rows = equity.value.curve || [];
           cumData = rows.map(function (r) { return Number(r.nav); });
-          dates = rows.map(function (r) { return (r.created_at || '').slice(5, 10); });
+          // 起点/重置锚点用「起点」「重置#N」作横轴标签; 对局用日期
+          dates = rows.map(function (r) {
+            return r.is_reset ? (r.label || '重置') : (r.created_at || '').slice(5, 10);
+          });
         } else {
           rows = history.value.slice().reverse();   // 按时间正序
           // 累计净值: 按「最新净值比例」复利累乘 (而非简单相加百分比)
@@ -614,6 +723,9 @@
               const i = ps[0].dataIndex;
               const r = rows[i] || {};
               const nav = Number(ps[0].value);
+              if (r.is_reset) {
+                return '<b>' + (r.label || '重置') + '</b><br/>收益率归 0 (当前净值 100)';
+              }
               return (r.created_at || '').slice(0, 16) + '<br/>累计净值 <b>' + nav.toFixed(2) +
                      '</b> (累计收益率 ' + (nav - 100).toFixed(2) + '%)<br/>本局 ' +
                      (r.pnl_pct > 0 ? '+' : '') + (r.pnl_pct || 0) + '% · ' +
@@ -695,6 +807,9 @@
           };
         }
 
+        // 需求3: 同步渲染本局训练划线 (水平线/矩形/箭头/射线/直线)
+        if (d.annos && d.annos.length) series.push(buildAnnoSeries(d.annos, all));
+
         klineChart.setOption({
           backgroundColor: 'transparent', animation: false,
           tooltip: {
@@ -708,8 +823,8 @@
             },
           },
           grid: [
-            { left: 52, right: 16, top: 16, height: '58%' },
-            { left: 52, right: 16, top: '78%', height: '16%' },
+            { left: 52, right: 16, top: 16, height: '54%' },
+            { left: 52, right: 16, top: '72%', height: '13%' },
           ],
           xAxis: [
             { type: 'category', data: x, gridIndex: 0, axisLine: { lineStyle: { color: tc('--border-2', '#2a2f4a') } }, axisLabel: { color: tc('--text-dim', '#888'), fontSize: 10 } },
@@ -721,9 +836,10 @@
           ],
           series: series,
           dataZoom: [
-            { type: 'inside', xAxisIndex: [0, 1], start: 0, end: 100, moveOnMouseWheel: true, zoomOnMouseWheel: true },
+            // 需求101506-3: 支持触控板左右滑动平移; 禁用滚轮/捏合缩放改范围
+            { type: 'inside', xAxisIndex: [0, 1], start: 0, end: 100, moveOnMouseWheel: true, zoomOnMouseWheel: false, moveOnMouseMove: true, zoomOnMouseMove: false },
             { type: 'slider', xAxisIndex: [0, 1], start: 0, end: 100,
-              bottom: 2, height: 14,
+              bottom: 6, height: 30,
               borderColor: tc('--border-2', '#262b4d'), backgroundColor: tc('--slider-bg', 'rgba(38,42,77,0.4)'),
               fillerColor: tc('--slider-fill', 'rgba(38,167,255,0.15)'), handleStyle: { color: tc('--brand-2', '#26a7ff') },
               textStyle: { color: tc('--text-dim', '#8892b0'), fontSize: 9 } },
@@ -740,6 +856,20 @@
         });
         // 黑白主题切换 → 按新配色重绘收益曲线与复盘K线
         window.addEventListener('themechange', function () { redraw(); });
+        // 需求101506-4: ↑/↓ 键缩放滑动条范围 (复盘页激活时生效, 输入框内不拦截)
+        window.addEventListener('keydown', function (e) {
+          if (!props.active || !klineChart) return;
+          const el = e.target;
+          const tag = ((el && el.tagName) || '').toUpperCase();
+          if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (el && el.isContentEditable)) return;
+          if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+            e.preventDefault();
+            window.KZoom(klineChart, e.key === 'ArrowUp' ? 'in' : 'out');
+          }
+        });
+        // 需求101506-3: 触控板捏合(ctrl+wheel)不改滑动条范围, 同时阻止页面缩放
+        const kEl = document.getElementById('review-kline');
+        if (kEl) kEl.addEventListener('wheel', function (e) { if (e.ctrlKey) e.preventDefault(); }, { passive: false });
       });
 
       // Tab 切到复盘时: 刷新数据 + 建图 (此时容器才有尺寸)

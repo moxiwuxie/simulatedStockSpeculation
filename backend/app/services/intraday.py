@@ -110,6 +110,37 @@ def generate_intraday_real(code: str, day, open_: float, high: float, low: float
     return data
 
 
+def build_intraday_from_minutes(day, pts, prev_close: Optional[float],
+                                extra: Optional[dict] = None) -> Optional[dict]:
+    """需求101601: 仅凭真实分钟序列构造分时 (当日日K尚未更新时使用)
+
+    当日开市时, akshare 日K通常要收盘后才更新, 因此无法沿用日K的 OHLC;
+    OHLC 与振幅改由分钟序列推导, 昨收取自上一交易日收盘, 保证「当日最新分时」可见。
+    无分钟数据返回 None (调用方回退)。
+    """
+    pts = pts or []
+    if not pts:
+        return None
+    points, cum_v, cum_pv, prices = [], 0, 0.0, []
+    for t, p, v in pts:
+        cum_v += v
+        cum_pv += p * v
+        prices.append(p)
+        points.append({"time": t, "price": round(p, 2),
+                       "avg": round(cum_pv / cum_v, 2), "volume": v})
+    hi, lo = max(prices), min(prices)
+    data = {
+        "date": str(day), "prev_close": prev_close,
+        "open": round(prices[0], 2), "high": round(hi, 2),
+        "low": round(lo, 2), "close": round(prices[-1], 2),
+        "amplitude": round((hi - lo) / prev_close * 100, 2) if prev_close else None,
+        "suspended": False, "source": "real", "points": points,
+    }
+    if extra:
+        data.update(extra)
+    return data
+
+
 def generate_intraday(code: str, day, open_: float, high: float, low: float,
                       close: float, volume: int, prev_close: Optional[float]) -> dict:
     """合成某日分时。返回 {date, prev_close, suspended, open/high/low/close, amplitude, points:[...]}"""

@@ -189,6 +189,30 @@ class TestDynGroupCRUD:
         # 预设分组同样可求值
         assert [h["code"] for h in dg.stocks("u_a", "preset_zhaban")] == ["600519"]
 
+    def test_recent_metrics_recorded_on_save(self, dg):
+        dg.add_group("u_a", "放量", {"conditions": [
+            {"metric": "volume", "op": "gt", "value": 900},
+            {"metric": "change_pct", "op": "gt", "value": 3}]})
+        assert set(dg.recent_metrics("u_a")) == {"volume", "change_pct"}
+
+    def test_recent_metrics_most_recent_first_and_capped(self, dg):
+        dg.add_group("u_a", "g1", {"conditions": [{"metric": "volume", "op": "gt", "value": 1}]})
+        dg.add_group("u_a", "g2", {"conditions": [{"metric": "change_pct", "op": "gt", "value": 1}]})
+        assert dg.recent_metrics("u_a")[0] == "change_pct"
+        # 重复使用只刷新时间, 不产生重复项
+        dg.add_group("u_a", "g3", {"conditions": [{"metric": "volume", "op": "gt", "value": 1}]})
+        assert dg.recent_metrics("u_a") == ["volume", "change_pct"]
+        assert len(dg.recent_metrics("u_a", limit=1)) == 1
+
+    def test_recent_metrics_isolated_between_users(self, dg):
+        dg.add_group("u_a", "放量", {"conditions": [{"metric": "volume", "op": "gt", "value": 900}]})
+        assert dg.recent_metrics("u_a") == ["volume"]
+        assert dg.recent_metrics("u_b") == []
+
+    def test_recent_metrics_ignores_unknown_keys(self, dg):
+        dg.record_recent("u_a", ["nope", "volume"])
+        assert dg.recent_metrics("u_a") == ["volume"]
+
 
 def _parse(records):
     from app.services.market_spot import MarketSpot
@@ -228,13 +252,31 @@ class TestDynGroupEndpoints:
 
     def test_preview_counts(self, m):
         r = m.dyn_groups_preview(m.DynPreviewRequest(
-            rules={"conditions": [{"metric": "upper_shadow", "op": "gt", "value": 2}]}), _user_id="u_e2e")
+            rules={"conditions": [{"metric": "upper_shadow", "op": "gt", "value": 2}]}), user_id="u_e2e")
         assert [h["code"] for h in r["stocks"]] == ["600519"]
 
     def test_preview_rejects_empty_rules(self, m):
         with pytest.raises(m.HTTPException) as e:
-            m.dyn_groups_preview(m.DynPreviewRequest(rules={"conditions": []}), _user_id="u_e2e")
+            m.dyn_groups_preview(m.DynPreviewRequest(rules={"conditions": []}), user_id="u_e2e")
         assert e.value.status_code == 400
+
+    def test_metrics_metadata_has_category_and_hot(self, m):
+        metas = {x["key"]: x for x in m.dyn_group_metrics()["metrics"]}
+        assert metas["is_limit_up"]["cat"] == "涨停异动"
+        assert metas["upper_shadow"]["cat"] == "技术面"
+        assert metas["price"]["cat"] == "价格成交"
+        assert metas["is_limit_up"]["hot"] is True
+        assert not metas["volume"].get("hot")
+
+    def test_recent_metrics_endpoint_after_save_and_preview(self, m):
+        assert m.dyn_groups_recent_metrics(user_id="u_e2e")["metrics"] == []
+        m.dyn_groups_add(m.DynGroupRequest(
+            name="放量", rules={"conditions": [{"metric": "volume", "op": "gt", "value": 900}]}),
+            user_id="u_e2e")
+        assert m.dyn_groups_recent_metrics(user_id="u_e2e")["metrics"] == ["volume"]
+        m.dyn_groups_preview(m.DynPreviewRequest(
+            rules={"conditions": [{"metric": "change_pct", "op": "gt", "value": 0}]}), user_id="u_e2e")
+        assert m.dyn_groups_recent_metrics(user_id="u_e2e")["metrics"][0] == "change_pct"
 
     def test_missing_group_404(self, m):
         with pytest.raises(m.HTTPException) as e:

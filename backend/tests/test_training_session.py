@@ -47,6 +47,27 @@ def db_path(tmp_path):
     return tmp_path / "training.db"
 
 
+def open_next(session, **kw):
+    """需求4: 买入委托 → 推进一根 K 线 → 于「次日开盘价」成交
+
+    返回成交回报 (session.last_fill): {action, price, qty, date, bar_index}
+    """
+    session.buy(**kw)
+    session.advance()
+    return session.last_fill
+
+
+def open_next_t1(session, **kw):
+    """需求1(T+1): 买入并在「次日」解锁后再返回 —— 用于需要当日平仓的用例
+
+    买点成交发生在推进的第 1 根 K 线; 该日持仓锁定, 再推进一日才可卖出。
+    """
+    session.buy(**kw)
+    session.advance()     # 成交 (当日锁定)
+    session.advance()     # 次日, 持仓解锁
+    return session.last_fill
+
+
 @pytest.fixture
 def fresh_manager(db_path):
     """重置 TrainingManager 单例 + 注入临时 db"""
@@ -96,10 +117,11 @@ class TestSessionBasics:
         assert session.portfolio_value == pytest.approx(100_000, abs=0.01)
 
     def test_portfolio_value_with_position(self, session):
-        """买 100 股, portfolio = cash + pos * current_price"""
-        session.buy(qty=100)  # 100*100 = 10000, 手续费 3 元
-        expected_cash = 100_000 - 10_000 - 3  # 90000 - 3
-        assert session.portfolio_value == pytest.approx(expected_cash + 100 * 100, abs=0.01)
+        """买 100 股 (次日开盘成交), portfolio = cash + pos * current_price"""
+        open_next(session, qty=100)         # 成交价 = 次日开盘 100
+        expected_cash = 100_000 - 10_000 - 3
+        assert session.portfolio_value == pytest.approx(
+            expected_cash + 100 * session.current_price, abs=0.01)
 
     def test_pnl_and_pct(self, session):
         """空仓 pnl=0"""
@@ -126,76 +148,101 @@ class TestSessionBasics:
 # BUY / SELL 开平仓核心
 # =============================================================
 class TestBuySell:
+    def test_buy_places_pending_order(self, session):
+        """需求4: buy() 只挂单, 不立即成交; 成交发生在下一根 K 线开盘"""
+        r = session.buy(qty=100)
+        assert r["action"] == "BUY_PENDING"
+        assert r["pending"] is True
+        assert session.pos == 0                      # 尚未成交
+        assert session.cash == 100_000
+        assert session.pending_buy is not None
+
     def test_open_long_default_qty(self, session):
-        """默认自动缩量: 100000 / 100 / 100 = 10 手 = 1000 股"""
-        result = session.buy()
-        assert result["action"] == "BUY"
-        assert result["qty"] >= 1  # 至少 1 股
-        assert session.pos == result["qty"]
-        assert session.avg_cost == 100.0
+        """默认自动缩量: 满仓 → 999 股 (手续费导致 1000 缩到 999)"""
+        fill = open_next(session)
+        assert fill["action"] == "BUY"
+        assert fill["qty"] >= 100
+        assert session.pos == fill["qty"]
+        assert session.avg_cost == 100.0             # 成交价 = 次日开盘 100
         assert session.cash < 100_000
 
     def test_open_long_exact_qty(self, session):
-        result = session.buy(qty=500)
-        assert result["qty"] == 500
+        fill = open_next(session, qty=500)
+        assert fill["qty"] == 500
         assert session.pos == 500
         expected_cash = 100_000 - 500 * 100 - session._fee(500 * 100)
         assert session.cash == pytest.approx(expected_cash, abs=0.01)
 
     def test_open_long_half_ratio(self, session):
-        """二分之一仓: 满仓(100000/100=1000股)的一半 = 500 股"""
-        result = session.buy(ratio=0.5)
-        assert result["action"] == "BUY"
-        assert result["qty"] == 500
+        """二分之一仓: 总资产×0.5 / 100 = 500 股"""
+        fill = open_next(session, ratio=0.5)
+        assert fill["action"] == "BUY"
+        assert fill["qty"] == 500
         assert session.pos == 500
 
     def test_open_long_tenth_ratio(self, session):
         """十分之一仓: 100000×0.1/100 = 100 股"""
-        result = session.buy(ratio=0.1)
-        assert result["qty"] == 100
+        fill = open_next(session, ratio=0.1)
+        assert fill["qty"] == 100
         assert session.pos == 100
 
     def test_ratio_anchors_to_total_assets(self, session):
         """仓位锚定账户总资产: 已有 50% 仓时再买 50% 按总资产×50% 而非剩余现金×50%"""
-        session.buy(qty=500)                       # 50% 仓位, cash≈49985, 总资产≈99985
+        open_next(session, qty=500)                 # 50% 仓位, cash≈49985, 总资产≈100985
         pv, bp = session.portfolio_value, session._buying_power()
-        result = session.buy(ratio=0.5)
-        # 目标市值 = 总资产 × 0.5 ≈ 49992, 受可用现金约束(≈49985) → 400 股 (旧逻辑仅 200)
-        assert result["qty"] == 400
-        assert result["qty"] == int(min(pv * 0.5, bp) / 100 / 100) * 100
+        fill = open_next(session, ratio=0.5)
+        # 目标市值 = 总资产 × 0.5 ≈ 50492, 受可用现金约束(≈49985) → 400 股 (旧逻辑仅 200)
+        assert fill["qty"] == 400
+        assert fill["qty"] == int(min(pv * 0.5, bp) / 100 / 100) * 100
 
     def test_open_long_auto_reduce_on_insufficient_cash(self, session):
         """请求远超现金 → 自动缩量"""
-        result = session.buy(qty=999_999)
-        assert result["qty"] < 999_999
-        assert session.pos == result["qty"]
-        # cash 不能为负
-        assert session.cash >= 0
+        fill = open_next(session, qty=999_999)
+        assert fill["qty"] < 999_999
+        assert session.pos == fill["qty"]
+        assert session.cash >= 0                    # cash 不能为负
 
     def test_open_long_zero_qty_raises(self, session):
+        """数量 <= 0 的委托在成交阶段被拒绝"""
+        session.buy(qty=0)
         with pytest.raises(ValueError):
-            session.buy(qty=0)
+            session.advance()
+        session.buy(qty=-10)
         with pytest.raises(ValueError):
-            session.buy(qty=-10)
+            session.advance()
+
+    def test_buy_locked_same_day(self, session):
+        """需求1(T+1): 当日买入不可卖出, 次日解锁后方可卖"""
+        session.buy(qty=100)
+        session.advance()                          # 成交 @100, 当日锁定
+        assert session.pos == 100
+        assert session.summary()["locked_qty"] == 100
+        assert session.summary()["sellable_qty"] == 0
+        with pytest.raises(ValueError):
+            session.sell(qty=100)                  # 当日买入(T+1) 拒绝
+        session.advance()                          # 次日, 持仓解锁
+        assert session.summary()["sellable_qty"] == 100
+        result = session.sell(qty=100)             # 解锁后可卖
+        assert result["action"] == "SELL"
+        assert session.pos == 0
 
     def test_close_long(self, session):
-        """开多 100 → 平多 100 @102 (推进后)"""
-        session.buy(qty=100)
-        session.advance()  # bars_used=1, current_price=102
+        """开多 100 → 次日解锁 → 平多 100 @101"""
+        open_next_t1(session, qty=100)   # 成交 @100, 次日解锁, 现价 101
         result = session.sell(qty=100)
         assert result["action"] == "SELL"
-        assert result["pnl"] == pytest.approx((102 - 100) * 100, abs=0.01)  # 200 元
+        assert result["pnl"] == pytest.approx((101 - 100) * 100, abs=0.01)  # 100 元
         assert session.pos == 0
         assert session.round_trips == 1
         assert session.win_count == 1
         assert session.avg_cost == 0
 
     def test_close_long_partial(self, session):
-        """开多 999 (手续费导致 1000 缩量) → 平 400"""
-        # buy(qty=1000) 时 cost=1000*100+fee(100000)=100000+30=100030 > 100000 → 缩到 999
+        """开多 1000 → 缩量到 999 (手续费) → 次日解锁 → 平 400"""
         session.buy(qty=1000)
+        session.advance()                # 成交 @100 → 缩到 999, 当日锁定
         assert session.pos == 999
-        session.advance()  # bars_used=1, current_price=102
+        session.advance()                # 次日解锁
         session.sell(qty=400)
         assert session.pos == 599
         assert session.round_trips == 1  # 部分平仓也算
@@ -206,19 +253,19 @@ class TestBuySell:
 
     def test_close_loss_trade(self, session):
         """买入后股价跌 → 平仓亏损"""
-        session.buy(qty=100)
+        session.buy(qty=100)             # 委托 @100
         # 前进 2 步: 100 → 102 → 101 (跌了 1)
-        session.advance()  # 102
-        session.advance()  # 101
+        session.advance()                # 成交 @100, current_price=102
+        session.advance()                # 101
         result = session.sell(qty=100)
         assert result["pnl"] == pytest.approx((101 - 100) * 100, abs=0.01)  # 100 元盈利
         assert session.win_count == 1
 
     def test_add_position_weighted_avg(self, session):
         """加仓 → 加权均价"""
-        session.buy(qty=100)  # @100, avg=100
-        session.advance()  # @102
-        session.buy(qty=100)  # @102
+        open_next(session, qty=100)      # 成交 @100, avg=100
+        fill = open_next(session, qty=100)  # 下一根开盘 102 成交
+        assert fill["price"] == pytest.approx(102.0)
         # 加权: (100*100 + 102*100) / 200 = 101
         assert session.avg_cost == pytest.approx(101.0, abs=0.01)
         assert session.pos == 200
@@ -446,24 +493,85 @@ class TestManagerStart:
 
 
 # =============================================================
+# 需求101604: 预生成会话 (prime) —— 「点击开始训练前就备好数据」
+# =============================================================
+class TestTrainingPrime:
+    """prime 与 start 共用同一构建路径, 但 prime 不注册活动会话、不写库"""
+
+    def _wire(self, ts, bars):
+        fake = MagicMock(return_value=bars)
+        ts.CATEGORY_FETCHERS = {"stock": fake, "limit_up": fake}
+        return fake
+
+    def test_prime_does_not_persist_until_start(self, fresh_manager, sample_bars):
+        from app.services import training_session as ts
+        m = fresh_manager
+        self._wire(ts, sample_bars * 20)
+        persisted = []
+        m._persist_session = lambda s: persisted.append(s.session_id)
+
+        primed = m.prime("stock", bars_count=50, code="600519")
+        assert primed is not None
+        assert persisted == []                       # 预生成不写库、不进训练历史
+
+        started = m.start("stock", bars_count=50, code="600519")
+        assert started.session_id == primed.session_id   # 同参数 → 复用同一份预生成数据
+        assert persisted == [started.session_id]         # 只有被消费后才写库
+
+    def test_expired_prime_is_discarded(self, fresh_manager, sample_bars):
+        import time
+        from app.services import training_session as ts
+        m = fresh_manager
+        self._wire(ts, sample_bars * 20)
+        primed = m.prime("stock", bars_count=50, code="600519")
+        key = m._prime_key("stock", 50, "600519", 100_000.0, None, None,
+                           "default", "day", None)
+        m._primed[key] = (time.time() - 9_999, primed)   # 强制过期
+        started = m.start("stock", bars_count=50, code="600519")
+        assert started.session_id != primed.session_id   # 过期 → 现场重建
+
+    def test_different_params_do_not_reuse(self, fresh_manager, sample_bars):
+        from app.services import training_session as ts
+        m = fresh_manager
+        self._wire(ts, sample_bars * 20)
+        primed = m.prime("stock", bars_count=50, code="600519")
+        started = m.start("stock", bars_count=30, code="600519")
+        assert started.session_id != primed.session_id
+        assert started.bars_total == 30
+
+    def test_prime_failure_is_graceful(self, fresh_manager):
+        from app.services import training_session as ts
+        m = fresh_manager
+        boom = MagicMock(side_effect=RuntimeError("upstream down"))
+        ts.CATEGORY_FETCHERS = {"stock": boom, "limit_up": boom}
+        assert m.prime("stock", bars_count=50, code="600519") is None
+
+
+# =============================================================
 # 交易对统计 round_trips / win_count
 # =============================================================
 class TestRoundTripStats:
     def test_win_trade_counted(self, session):
         session.buy(qty=100)  # @100
-        session.advance()  # @102 (浮盈)
-        session.sell(qty=100)  # 平多 +200
+        session.advance()  # 成交 @100 (当日锁定)
+        session.advance()  # 次日解锁 (现价 101, 浮盈)
+        session.sell(qty=100)  # 平多 +100
         assert session.round_trips == 1
         assert session.win_count == 1
         assert session.trades_count == 2  # buy + sell
 
-    def test_loss_trade_counted(self, session):
-        """股价没动平掉 = 盈亏 0 → win_count 不增加"""
-        session.buy(qty=100)  # @100
-        session.sell(qty=100)  # @100 (同 bar 卖, 但当前价还是 100)
-        # 等等——sell 不推进 bar, 所以 price 还是 100, pnl=0
-        assert session.round_trips == 1
-        assert session.win_count == 0  # pnl=0, 不算赢
+    def test_loss_trade_counted(self):
+        """平仓盈亏为 0 → win_count 不增加"""
+        flat = [{"date": f"2026-01-0{i+1}", "open": 100, "high": 101, "low": 99,
+                 "close": 100, "volume": 1000} for i in range(4)]
+        s = TrainingSession("s_flat", "stock", "600519", flat, 100_000.0)
+        s.buy(qty=100)
+        s.advance()                     # 成交 @100 (次日开盘), 当日锁定
+        s.advance()                     # 次日解锁 (现价仍 100)
+        s.sell(qty=100)                 # pnl = 0
+        assert s.round_trips == 1
+        assert s.win_count == 0         # pnl=0, 不算赢
+        assert s.trades_count == 2      # buy + sell
 
     def test_win_rate_zero_round_trips(self, session):
         """还没平仓 → win_rate=0 不除以 0"""
@@ -518,20 +626,24 @@ class TestConditionalOrders:
         assert c["triggered_pnl"] == pytest.approx(300.0)     # (103-100)*100
 
     def test_stop_loss_triggers_on_low(self, session):
-        """多头止损: K 线最低价触及触发价 → 自动平仓"""
-        session.buy(qty=100)                      # @100
-        session.set_conditional("stop_loss", 99.0)
-        session.advance()                         # bar0 low=99 <= 99 → 触发
+        """多头止损: K 线最低价触及触发价 → 自动平仓 (T+1 解锁后)"""
+        session.advance()                         # 走到 bar0, 现价 102
+        session.buy(qty=100)                      # 决策 @102, 次日开盘成交
+        session.advance()                         # 成交 @102, 当日锁定, 现价 101
+        session.set_conditional("stop_loss", 100.5)   # 100.5 < 101, 合法
+        session.advance()                         # 次日解锁; bar2 low=100 <= 100.5 → 触发
         assert session.pos == 0
         c = session.conditionals[0]
         assert c["status"] == "triggered"
-        assert c["triggered_pnl"] == pytest.approx(-100.0)    # (99-100)*100
+        assert c["triggered_pnl"] == pytest.approx((100.5 - 102) * 100)   # -150
 
     def test_partial_ratio_closes_part_position(self, session):
-        """按比例部分平仓: ratio=0.5 → 平一半"""
+        """按比例部分平仓: ratio=0.5 → 平一半 (T+1 解锁后)"""
         session.buy(qty=200)                      # @100, pos=200
-        session.set_conditional("stop_loss", 99.0, ratio=0.5)
-        session.advance()
+        session.advance()                         # 成交 @100, 当日锁定
+        session.advance()                         # 次日解锁, 现价 101
+        session.set_conditional("stop_loss", 100.5, ratio=0.5)
+        session.advance()                         # bar2 low=100 → 触发
         assert session.pos == 100
         assert session.conditionals[0]["triggered_qty"] == 100
 
@@ -574,11 +686,11 @@ class TestConditionalOrders:
 
     def test_wrong_side_price_rejected(self, session):
         """多头止盈价必须高于现价"""
-        session.buy(qty=100)                      # 现价 100
+        open_next(session, qty=100)                # 成交, pos=100, 现价 102
         with pytest.raises(ValueError):
             session.set_conditional("take_profit", 99.0)
         with pytest.raises(ValueError):
-            session.set_conditional("stop_loss", 101.0)
+            session.set_conditional("stop_loss", 105.0)
 
     def test_summary_exposes_conditionals(self, session):
         """summary 输出条件单列表, 供前端展示"""
@@ -591,10 +703,11 @@ class TestConditionalOrders:
 
     def test_liquidation_keeps_conditional_active(self, session):
         """手动平仓后, 条件单仍保留 (触发时再判定是否可操作)"""
-        session.buy(qty=100)
-        session.set_conditional("take_profit", 110.0)
+        open_next(session, qty=100)               # 成交, pos=100, 现价 102
+        session.advance()                         # 次日解锁 (现价 101)
+        session.set_conditional("take_profit", 120.0)
         session.sell(qty=100)                     # 手动平多 → pos=0
-        session.advance()                         # bar0 high=101 < 110, 未触发
+        session.advance()                         # bar2 high=102 < 120, 未触发
         assert session.conditionals[0]["status"] == "active"
 
 
@@ -1055,15 +1168,25 @@ class TestEquityNav:
                    VALUES (?,?,?,?,?,?,?,?)""",
                 (sid, status, "stock", "600519", 1, created_at, pnl_pct, user_id))
 
+    def test_curve_starts_at_100_anchor(self, fresh_manager):
+        """需求6: 收益曲线初始为 100 净值 / 0% 收益率"""
+        m = fresh_manager
+        d = m.equity_nav("u1")
+        assert d["curve"][0]["nav"] == 100.0
+        assert d["curve"][0]["pnl_pct"] == 0.0
+        assert d["curve"][0]["is_reset"] is True
+        assert d["curve"][0]["label"] == "起点"
+        assert d["nav"] == 100.0
+
     def test_compound_nav_after_reset(self, fresh_manager):
         m = fresh_manager
         self._insert(m, "s1", 10.0, "2026-01-01 10:00:00")
         self._insert(m, "s2", -20.0, "2026-01-02 10:00:00")
         d = m.equity_nav("u1")
-        # 100 * 1.1 * 0.8 = 88
+        # 100(起点) * 1.1 * 0.8 = 88
         assert d["nav"] == pytest.approx(88.0, abs=0.01)
         assert d["can_start"] is True
-        assert [c["nav"] for c in d["curve"]] == [pytest.approx(110.0), pytest.approx(88.0)]
+        assert [c["nav"] for c in d["curve"]] == [100.0, pytest.approx(110.0), pytest.approx(88.0)]
 
     def test_zero_nav_blocks_start(self, fresh_manager):
         m = fresh_manager
@@ -1073,13 +1196,18 @@ class TestEquityNav:
         assert d["can_start"] is False
 
     def test_reset_keeps_records_and_counts(self, fresh_manager):
+        """需求3: 重置只把收益率归 0, 不清理之前的收益曲线数据"""
         m = fresh_manager
         self._insert(m, "s1", -100.0, "2026-01-01 10:00:00", status="blown_up")
         d = m.reset_equity("u1")
         assert d["reset_count"] == 1
-        assert d["nav"] == 100.0            # 起点重置回基准
+        assert d["nav"] == 100.0            # 收益率归 0 (净值回基准)
         assert d["can_start"] is True
-        assert d["curve"] == []             # 重置前的记录不再计入曲线
+        labels = [c.get("label") for c in d["curve"]]
+        assert labels[0] == "起点"           # 曲线仍从起点开始
+        assert "重置#1" in labels            # 重置插入锚点
+        # 重置前的历史点仍保留在曲线上
+        assert any(c.get("session_id") == "s1" for c in d["curve"])
         # 训练记录本身保留
         assert any(r["session_id"] == "s1" for r in m.list_history(user_id="u1"))
         # 再次重置累加次数
@@ -1087,7 +1215,7 @@ class TestEquityNav:
 
 
 # =============================================================
-# 周期视图 MACD (B11): 日线算 + 周期桶末采样, 与展示序列对齐
+# 周期视图 MACD (需求5): 周/月/年线在「周期序列」上独立计算, 不再由日线采样
 # =============================================================
 class TestPeriodMacd:
     @staticmethod
@@ -1108,15 +1236,40 @@ class TestPeriodMacd:
         assert len(m["dea"]) == n
         assert len(m["hist"]) == n
 
-    def test_year_period_has_no_macd_gap(self):
-        # 年线聚合后仅 1~2 根, 但 MACD 在日线上计算 → 不应出现大面积 null
+    def test_period_macd_independent_from_daily(self):
+        """需求5: 周线 MACD 与「周线序列上独立计算」完全一致 (非日线采样)"""
+        from app.services.training_session import _macd_js, aggregate_bars
         s = TrainingSession("s_macd2", "stock", "600519", self._bars(300), 1_000_000.0)
         s.code_revealed = 1                  # 揭晓后展示完整周期序列
-        s.switch_period("year")
+        s.switch_period("week")
+        m = s.period_macd()
+        assert len(m["dif"]) == len(s._display_bars())
+        weekly = [b["close"] for b in aggregate_bars(s._daily, "week")[0]]
+        dif, dea, hist = _macd_js(weekly)
+        assert m["dif"] == dif
+        assert m["dea"] == dea
+        assert m["hist"] == hist
+
+    def test_warmup_converges_period_macd(self):
+        """需求5: 预热段让 EMA 收敛 → 月/年线训练段不应出现 null"""
+        s = TrainingSession("s_macd2b", "stock", "600519", self._bars(300), 1_000_000.0,
+                            warmup_bars=self._bars(1500))
+        s.code_revealed = 1
+        s.switch_period("month")
         m = s.period_macd()
         assert len(m["dif"]) == len(s._display_bars())
         assert all(v is not None for v in m["dif"])
         assert all(v is not None for v in m["dea"])
+
+    def test_year_macd_converges_with_full_warmup(self):
+        """年线 span=240 → 需 ≥26 根年K 的预热才出值 (WARMUP_CAP 放宽到 8000)"""
+        s = TrainingSession("s_macd2c", "stock", "600519", self._bars(300), 1_000_000.0,
+                            warmup_bars=self._bars(8000))
+        s.code_revealed = 1
+        s.switch_period("year")
+        m = s.period_macd()
+        assert len(m["dif"]) == len(s._display_bars())
+        assert all(v is not None for v in m["dif"])
 
     def test_daily_macd_warmup_nulls(self):
         # 日线上 EMA 预热期仍为 null (口径与前端 indicators.js 一致)
@@ -1153,5 +1306,349 @@ class TestVolumeAnomaly:
     def test_insufficient_bars_returns_false(self):
         from app.services import stock_pool as sp
         assert sp.has_volume_anomaly(self._bars([100, 200, 300])) is False
+
+
+# =============================================================
+# 需求1: 开始训练不再凭空新增「副本」战法
+# =============================================================
+class TestNoAutoCopyStrategy:
+    @staticmethod
+    def _insert_copy(m, description="系统默认战法", name="副本"):
+        with sqlite3.connect(str(m._db_path)) as conn:
+            conn.execute("INSERT INTO strategies (name, description, color, created_at) VALUES (?,?,?,?)",
+                         (name, description, "#00b5ff", "2026-01-01 00:00:00"))
+            conn.commit()
+            return conn.execute("SELECT id FROM strategies WHERE name=?", (name,)).fetchone()[0]
+
+    def test_start_session_keeps_strategy_null(self, fresh_manager, sample_bars):
+        """训练未指定战法 → 不创建战法, strategy_id 保持 None"""
+        from app.services import training_session as ts
+        m = fresh_manager
+        fake = MagicMock(return_value=sample_bars * 40)   # 避免真实抓取
+        ts.CATEGORY_FETCHERS = {"stock": fake}
+        s = m.start("stock", bars_count=20, code="600519")
+        assert s.strategy_id is None
+        assert m.list_strategies() == []      # 战法库不凭空出现「副本」
+
+    def test_legacy_copy_without_records_is_hidden(self, fresh_manager):
+        """系统遗留「副本」且无任何训练记录 → 不展示"""
+        m = fresh_manager
+        self._insert_copy(m)
+        assert m.list_strategies() == []
+        assert m.strategy_stats() == []
+
+    def test_copy_with_records_is_kept(self, fresh_manager, db_path):
+        """「副本」若已关联训练记录 → 作为标签保留 (删战法不删记录)"""
+        m = fresh_manager
+        sid = self._insert_copy(m)
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                """INSERT INTO training_sessions
+                   (session_id,status,category,code,created_at,strategy_id,user_id)
+                   VALUES (?,?,?,?,?,?,?)""",
+                ("s_copy", "settled", "stock", "600519", "2026-01-02 10:00:00", sid, "u1"))
+            conn.commit()
+        names = [s["name"] for s in m.list_strategies()]
+        assert "副本" in names
+        assert any(s["strategy_id"] == sid for s in m.strategy_stats("u1"))
+
+
+# =============================================================
+# 需求7: 满仓后不能再次买入 (不再强买 1 股 / 打成负数)
+# =============================================================
+class TestFullPositionNoDoubleBuy:
+    def test_buy_after_full_position_raises(self, session):
+        session.buy()                          # 满仓委托
+        session.advance()                      # 成交 @100 → pos 999
+        assert session.pos > 0
+        pos_before, cash_before = session.pos, session.cash
+        session.buy()                          # 再挂满仓委托
+        with pytest.raises(ValueError, match="资金不足"):
+            session.advance()                  # 次日开盘已无可买资金
+        assert session.pos == pos_before
+        assert session.cash == pytest.approx(cash_before, abs=0.01)
+        assert session.cash >= 0               # 现金不应被打成负数
+
+    def test_ratio_buy_then_full_rejected(self, session):
+        open_next(session, ratio=0.5)          # 半仓成交
+        open_next(session)                     # 补到满仓
+        session.buy()
+        with pytest.raises(ValueError):
+            session.advance()
+
+
+# =============================================================
+# 需求10: 周期桶按「训练前首根K线」锚点固定长度切分
+#   一次观望只新增一根, 且不改写已展示的 K 线
+# =============================================================
+class TestPeriodAnchor:
+    @staticmethod
+    def _bars(n):
+        return [{"date": f"2026-{i // 28 + 1:02d}-{i % 28 + 1:02d}",
+                 "open": 100.0 + i, "high": 101.0 + i, "low": 99.0 + i,
+                 "close": 100.5 + i, "volume": 1_000_000 + i}
+                for i in range(n)]
+
+    def test_bucket_ranges_fixed_span(self):
+        from app.services.training_session import bucket_ranges
+        assert bucket_ranges(self._bars(12), "week") == [(0, 5), (5, 10), (10, 12)]
+
+    def test_bucket_ranges_with_offset(self):
+        from app.services.training_session import bucket_ranges
+        assert bucket_ranges(self._bars(12), "week", offset=3) == [(0, 2), (2, 7), (7, 12)]
+
+    def test_week_advance_adds_one_bar_without_rewriting(self):
+        s = TrainingSession("s_pa1", "stock", "600519", self._bars(12), 1_000_000.0, period="week")
+        assert s.bars_total == 3
+        # 需求101606: 起始即展示「当前部分周」(仅覆盖 day1)
+        assert len(s.bars) == 1
+        assert s.bars[0]["date"] == "2026-01-01"
+        s.advance()                            # 走完第 1 桶 (5 个交易日)
+        assert s.days_used == 5
+        first = [dict(b) for b in s.bars]
+        assert len(first) == 2                 # 走完的完整周 + 当前部分周
+        assert first[0]["date"] == "2026-01-05"
+        assert first[1]["date"] == "2026-01-06"
+        s.advance()                            # 走完第 2 桶
+        second = [dict(b) for b in s.bars]
+        assert len(second) == 3                # 一次推进只新增一根
+        assert second[0] == first[0]           # 已走完的K线不被改写
+        assert second[1]["date"] == "2026-01-10"
+
+    def test_pre_anchor_truncated_to_span(self):
+        """周线锚点 = 训练前第一根K线: 背景按 span 截整, 训练首根另起一桶"""
+        s = TrainingSession("s_pa2", "stock", "600519", self._bars(12), 1_000_000.0,
+                            pre_bars=self._bars(247), period="week")
+        assert len(s.pre_bars) == 49           # 247 → 截为 245 根日K → 49 根周K
+        s.advance()
+        assert len(s.bars) == 2                # 需求101606: 完整周 + 当前部分周
+        s.advance()
+        assert len(s.bars) == 3
+
+
+# =============================================================
+# 需求4: 复盘历史记录点击 → 完整 K 线 (无操作也保留)
+# =============================================================
+class TestHistoryFullBars:
+    def test_no_action_session_still_has_full_bars(self, fresh_manager, sample_bars):
+        m = fresh_manager
+        sess = TrainingSession("h_noact", "stock", "600519", sample_bars, 100_000)
+        for _ in range(len(sample_bars)):      # 全程只观望, 不产生任何买卖
+            sess.hold()
+            m._persist_bar(sess, "HOLD")
+            sess.advance()
+        m._persist_session(sess)
+        m._finalize_session(sess)
+        detail = m.get_history("h_noact")
+        assert detail is not None
+        assert len(detail["bars"]) == len(sample_bars)     # 完整K线, 不因无操作而缺失
+        assert detail["actions_count"] == 0                # 明确标记「无买卖操作」
+        assert all(b["action"] == "HOLD" for b in detail["bars"])
+        assert len(detail["equity_curve"]) == len(sample_bars)
+
+
+# =============================================================
+# 需求2: 真实看盘模块 (聚合同花顺/开盘啦结构, 功能储备占位)
+# =============================================================
+class TestWatchPanorama:
+    def test_panorama_structure(self):
+        from app.services.watch import mock_panorama
+        d = mock_panorama(seed=20261012)
+        assert d["mode"] == "reserve"
+        assert d["sources"] == ["同花顺", "开盘啦"]
+        for k in ("indices", "breadth", "hot_boards", "rankings", "moneyflow", "sections"):
+            assert k in d
+        assert len(d["indices"]) > 0
+        assert d["rankings"]["gainers"][0]["pct"] >= d["rankings"]["gainers"][-1]["pct"]
+
+    def test_panorama_deterministic_per_seed(self):
+        from app.services.watch import mock_panorama
+        a, b = mock_panorama(seed=7), mock_panorama(seed=7)
+        for k in ("indices", "breadth", "hot_boards", "rankings", "moneyflow"):
+            assert a[k] == b[k]
+
+
+# =============================================================
+# 需求4: 买点由「当日收盘」改为「次日开盘价」成交
+# =============================================================
+class TestNextDayOpenFill:
+    @staticmethod
+    def _bars():
+        # bar0 决策: 收盘 100; bar1 跳空高开 105 (次日开盘)
+        return [
+            {"date": "2026-03-02", "open": 99, "high": 101, "low": 98,
+             "close": 100, "volume": 1_000_000},
+            {"date": "2026-03-03", "open": 105, "high": 108, "low": 104,
+             "close": 106, "volume": 1_200_000},
+            {"date": "2026-03-04", "open": 107, "high": 109, "low": 106,
+             "close": 108, "volume": 1_300_000},
+        ]
+
+    def test_fill_at_next_open_not_decision_close(self):
+        s = TrainingSession("s_ndo", "stock", "600519", self._bars(), 1_000_000.0)
+        s.buy(qty=100)
+        r = s.advance()
+        fill = r["pending_filled"]
+        assert fill["action"] == "BUY"
+        assert fill["price"] == pytest.approx(105.0)   # 次日开盘价, 而非决策日收盘 100
+        assert fill["bar_index"] == 1
+        assert fill["date"] == "2026-03-03"
+        assert s.pos == 100
+        assert s.avg_cost == pytest.approx(105.0)
+
+    def test_no_fill_before_advance(self):
+        s = TrainingSession("s_ndo2", "stock", "600519", self._bars(), 1_000_000.0)
+        s.buy(qty=100)
+        assert s.pos == 0                      # 决策当根不成交
+        assert s.pending_buy is not None
+        assert s.summary()["pending_buy"] is not None
+
+    def test_last_bar_pending_fails(self):
+        s = TrainingSession("s_ndo3", "stock", "600519", self._bars(), 1_000_000.0)
+        s.advance(); s.advance()               # 推进到最后一根
+        s.buy(qty=100)                         # 已无「下一根」可成交
+        r = s.advance()
+        assert r["pending_filled"]["action"] == "BUY_FAILED"
+        assert s.pos == 0
+
+    def test_buy_return_is_pending(self):
+        s = TrainingSession("s_ndo4", "stock", "600519", self._bars(), 1_000_000.0)
+        r = s.buy(qty=100)
+        assert r["action"] == "BUY_PENDING"
+        assert r["pending"] is True
+        assert r["price"] is None
+
+
+# =============================================================
+# 需求3/4: 涨停板无法买入 —— 缩量一字板判定
+# =============================================================
+class TestLimitOneWordBlock:
+    @staticmethod
+    def _bars(word_vol=100, prev_vol=2_000_000):
+        return [
+            {"date": "2026-04-01", "open": 99, "high": 100, "low": 98,
+             "close": 100, "volume": prev_vol},
+            # bar1: 一字涨停 (open=high=low=close=110), 成交量可调
+            {"date": "2026-04-02", "open": 110, "high": 110, "low": 110,
+             "close": 110, "volume": word_vol},
+            {"date": "2026-04-03", "open": 111, "high": 112, "low": 110,
+             "close": 111, "volume": 2_000_000},
+        ]
+
+    def test_one_word_limit_with_shrunk_volume_not_buyable(self):
+        s = TrainingSession("s_low", "stock", "600519", self._bars(word_vol=100), 10_000_000.0)
+        s.buy(qty=100)
+        r = s.advance()
+        assert r["pending_filled"]["action"] == "BUY_FAILED"
+        assert "一字" in r["pending_filled"]["reason"]
+        assert s.pos == 0
+
+    def test_plain_volume_limit_up_is_buyable(self):
+        """放量一字段 (量能未缩) 仍可买入"""
+        s = TrainingSession("s_lu2", "stock", "600519", self._bars(word_vol=3_000_000), 10_000_000.0)
+        s.buy(qty=100)
+        r = s.advance()
+        assert r["pending_filled"]["action"] == "BUY"
+        assert r["pending_filled"]["price"] == pytest.approx(110.0)
+
+    def test_limit_pct_by_board(self):
+        assert TrainingSession._limit_pct("600519") == 0.10
+        assert TrainingSession._limit_pct("300750") == 0.20    # 创业板
+        assert TrainingSession._limit_pct("688981") == 0.20    # 科创板
+
+
+# =============================================================
+# 需求7: 指定个股 + 起始日期 = 非双盲训练
+# =============================================================
+class TestSpecifiedNonBlind:
+    def test_code_and_date_is_non_blind(self, fresh_manager, sample_bars):
+        from app.services import training_session as ts
+        m = fresh_manager
+        fake = MagicMock(return_value=sample_bars * 5)     # 50 根
+        ts.CATEGORY_FETCHERS = {"stock": fake, "limit_up": fake}
+        s = m.start("stock", bars_count=20, code="600519", start_date="2026-01-05")
+        assert s.non_blind is True
+        meta = s.summary(hide_meta=True)                   # 非双盲: 即使 hide_meta 也展示
+        assert meta["code"] == "600519"
+        assert meta["non_blind"] is True
+        assert meta["start_date"] and meta["end_date"]
+
+    def test_code_only_stays_blind(self, fresh_manager, sample_bars):
+        from app.services import training_session as ts
+        m = fresh_manager
+        fake = MagicMock(return_value=sample_bars * 5)
+        ts.CATEGORY_FETCHERS = {"stock": fake, "limit_up": fake}
+        s = m.start("stock", bars_count=20, code="600519")
+        assert s.non_blind is False
+        meta = s.summary(hide_meta=True)
+        # 仅指定标的 (无起始日期): 非双盲不成立, 时间段仍隐藏 (只展示已指定的代码/名称)
+        assert meta["non_blind"] is False
+        assert meta["code_revealed"] == 0
+        assert "start_date" not in meta and "end_date" not in meta
+
+    def test_date_later_than_all_bars_raises(self, fresh_manager, sample_bars):
+        from app.services import training_session as ts
+        m = fresh_manager
+        ts.CATEGORY_FETCHERS = {"stock": MagicMock(return_value=sample_bars)}
+        with pytest.raises(ValueError, match="晚于"):
+            m.start("stock", bars_count=5, code="600519", start_date="2026-12-31")
+
+    def test_bad_date_format_raises(self, fresh_manager, sample_bars):
+        from app.services import training_session as ts
+        m = fresh_manager
+        ts.CATEGORY_FETCHERS = {"stock": MagicMock(return_value=sample_bars * 5)}
+        with pytest.raises(ValueError, match="格式"):
+            m.start("stock", bars_count=5, code="600519", start_date="2026/01/05")
+
+    def test_not_enough_bars_after_date_shrinks_window(self, fresh_manager, sample_bars):
+        """需求101401-3: 起始日期之后不足请求根数 → 按可用根数收缩, 不再直接报错"""
+        from app.services import training_session as ts
+        m = fresh_manager
+        ts.CATEGORY_FETCHERS = {"stock": MagicMock(return_value=sample_bars * 5)}
+        s = m.start("stock", bars_count=60, code="600519", start_date="2026-01-05")
+        assert s.non_blind is True
+        assert s.bars_total == 46                  # idx=4 → 50-4
+        assert s.start_date == "2026-01-05"
+        assert s.end_date == "2026-01-10"
+
+    def test_date_available_below_min_bars_raises(self, fresh_manager, sample_bars):
+        """起始日期之后不足单局最少 20 根 → 明确报错"""
+        from app.services import training_session as ts
+        m = fresh_manager
+        ts.CATEGORY_FETCHERS = {"stock": MagicMock(return_value=sample_bars * 2)}   # 20 根
+        with pytest.raises(ValueError, match="不足"):
+            m.start("stock", bars_count=250, code="600519", start_date="2026-01-09")   # 仅 12 根
+
+    def test_date_available_exactly_min_bars_ok(self, fresh_manager, sample_bars):
+        """可用根数恰好等于最少根数 → 边界可通过"""
+        from app.services import training_session as ts
+        m = fresh_manager
+        ts.CATEGORY_FETCHERS = {"stock": MagicMock(return_value=sample_bars * 2)}
+        s = m.start("stock", bars_count=250, code="600519", start_date="2026-01-01")
+        assert s.bars_total == 20
+        assert s.non_blind is True
+
+    def test_shrunk_window_week_bucket_consistent(self, fresh_manager, sample_bars):
+        """收缩窗口与周期桶自洽: 46 根 → 周线 10 桶 → 切回日线 46"""
+        from app.services import training_session as ts
+        m = fresh_manager
+        ts.CATEGORY_FETCHERS = {"stock": MagicMock(return_value=sample_bars * 5)}
+        s = m.start("stock", bars_count=60, code="600519", start_date="2026-01-05")
+        assert s.bars_total == 46
+        m.switch_period(s.session_id, "week")
+        assert s.bars_total == 10
+        m.switch_period(s.session_id, "day")
+        assert s.bars_total == 46
+
+    def test_shrunk_window_advance_to_end_auto_settles(self, fresh_manager, sample_bars):
+        """收缩窗口推进至末根自动结算, 不越界"""
+        from app.services import training_session as ts
+        m = fresh_manager
+        ts.CATEGORY_FETCHERS = {"stock": MagicMock(return_value=sample_bars * 5)}
+        s = m.start("stock", bars_count=60, code="600519", start_date="2026-01-05")
+        for _ in range(s.bars_total):
+            m.advance(s.session_id)
+        assert s.days_used == 46
+        assert s.status in ("settled", "blown_up")
 
 

@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>历史回放交易系统</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="style.css?v=40">
+<link rel="stylesheet" href="style.css?v=70">
 <!-- Vue 3 global build (包含 template compiler) -->
-<script src="vendor/vue.global.js?v=40"></script>
+<script src="vendor/vue.global.js?v=70"></script>
 <!-- ECharts -->
-<script src="vendor/echarts.min.js?v=40"></script>
+<script src="vendor/echarts.min.js?v=70"></script>
 </head>
 <body>
 
@@ -33,8 +33,17 @@
   </nav>
 
   <!-- ============ 主体行: 侧边栏 + 主内容 (flex-direction: row) ============ -->
-  <div class="app-body">
-  <aside class="sidebar" v-show="activeTab === 'kline'">
+  <div class="app-body" :class="{'wl-module': activeTab === 'kline'}">
+  <!-- 需求101501: 同一份分组个股列表在两处复用 ——
+       「自选」模块: wl-wide 铺满整个模块级宽度(单击仅选中/双击跳图表);
+       「图表」模块: wl-drawer 作为左侧抽屉(可被 drawer-btn 收起), 右侧展示K线/分时 -->
+  <aside class="sidebar"
+         :class="{
+           'wl-wide': activeTab === 'kline',
+           'wl-drawer': activeTab === 'chart',
+           collapsed: activeTab === 'chart' && !drawerOpen
+         }"
+         v-show="activeTab === 'kline' || activeTab === 'chart'">
     <div class="search-box">
       <input type="text" v-model="searchKw" placeholder="🔍 股票/板块 代码·名称·首字母" @input="debounceSearch">
       <div v-if="searchKw && (searchResults.stocks.length || searchResults.boards.length)" class="search-results">
@@ -55,47 +64,93 @@
     </div>
 
     <div class="watch-list">
-      <div class="wl-title">
-        <span :class="['grp-tag', isDynSelection ? 'dyn' : 'static']">
-          {{ isDynSelection ? '⚡ 动态分组' : '📌 自选分组' }}
-        </span>
-        <select v-model="watchGroupId" class="wl-group-select" @change="switchGroup(watchGroupId)">
-          <optgroup label="📌 自选分组 (静态)">
-            <option v-for="g in watchGroups" :key="'s' + g.id" :value="g.id">{{ g.name }}</option>
-            <option value="__none__">无</option>
-          </optgroup>
-          <optgroup label="⚡ 动态分组 (按指标实时获取)">
-            <option v-for="g in dynGroups" :key="'d' + g.id" :value="dynKey(g.id)">
-              {{ g.name }}{{ g.builtin ? ' · 内置' : '' }}
-            </option>
-          </optgroup>
-        </select>
+      <!-- 需求9: 分组标签横排在上方 (同花顺样式), 切换展示对应分组 -->
+      <div class="wl-tabs">
+        <div class="wl-tabs-scroll">
+          <span v-for="g in watchGroups" :key="'s' + g.id"
+                :class="['wl-tab', {active: watchGroupId === g.id}]"
+                @click="switchGroup(g.id)">
+            {{ g.name }}
+            <b v-if="grpPct(g).pct != null" :class="priceClass(grpPct(g).pct)">
+              {{ grpPct(g).pct > 0 ? '+' : '' }}{{ grpPct(g).pct.toFixed(2) }}%
+            </b>
+          </span>
+          <span v-for="g in dynGroups" :key="'d' + g.id"
+                :class="['wl-tab', 'dyn', {active: watchGroupId === dynKey(g.id)}]"
+                @click="switchGroup(dynKey(g.id))">⚡ {{ g.name }}</span>
+          <span :class="['wl-tab', 'none', {active: watchGroupId === NONE_GROUP}]"
+                @click="switchGroup(NONE_GROUP)">无</span>
+        </div>
+        <div class="wl-tabs-ops">
+          <button class="wl-icon-btn" title="添加表头" @click="openWlHeader">☰</button>
+          <button class="wl-icon-btn" title="新建分组" @click="toggleNewGroup">＋</button>
+          <button class="wl-icon-btn" title="刷新" @click="reloadWatchView(true)">🔄</button>
+          <button class="wl-icon-btn" title="从 txt/csv/tsv/json 文件导入自选" @click="triggerImport">📥</button>
+          <button class="wl-icon-btn danger" v-if="canDeleteGroup" title="删除当前分组" @click="delGroup()">🗑</button>
+          <input ref="importFile" type="file" accept=".txt,.csv,.tsv,.json" style="display:none" @change="onImportFile">
+        </div>
       </div>
-      <div class="wl-grp-ops">
-        <input v-model="newGroupName" placeholder="新建自选分组" class="wl-grp-input" @keyup.enter="addGroup">
-        <button class="btn mini" @click="addGroup" title="新建自选分组(静态)">＋</button>
-        <button class="btn mini" @click="openDynEditor()" title="新建动态分组">⚡</button>
-        <button class="btn mini" @click="triggerImport" title="从 txt/csv/tsv/json 文件导入自选">📥 导入</button>
-        <input ref="importFile" type="file" accept=".txt,.csv,.tsv,.json" style="display:none" @change="onImportFile">
-        <button class="btn mini danger" v-if="canDeleteGroup" @click="delGroup()" title="删除当前分组">🗑</button>
+
+      <!-- 需求8: 「新建分组」统一入口 → 自选分组 / 动态分组 二选一 -->
+      <div v-if="newGroupOpen" class="wl-newgrp-menu">
+        <span @click="startNewStatic">📌 自选分组</span>
+        <span @click="startNewDyn">⚡ 动态分组</span>
       </div>
+      <div v-if="newStaticOpen" class="wl-newgrp-form">
+        <input v-model="newGroupName" placeholder="自选分组名称" class="wl-grp-input" @keyup.enter="addGroup">
+        <button class="btn mini" @click="addGroup">确定</button>
+        <button class="btn mini ghost" @click="newStaticOpen = false">取消</button>
+      </div>
+
       <div v-if="isDynSelection" class="wl-hint">
         <span class="grp-count">命中 {{ stocks.length }} 只 · 每次按指标实时获取</span>
-        <button class="btn mini ghost" @click="reloadWatchView(true)">{{ dynLoading ? '获取中...' : '刷新' }}</button>
-        <button class="btn mini ghost" @click="openDynEditor(currentDynGroup)" title="查看/编辑规则">✎</button>
+        <button class="btn mini ghost" @click="openDynEditor(currentDynGroup)" title="查看/编辑规则">✎ 规则</button>
       </div>
+
+      <!-- 需求101508-1: 图表模块在个股列表上方展示当前分组名称 -->
+      <div v-if="activeTab === 'chart' && isLoggedIn" class="wl-drawer-title">{{ watchTitle }}</div>
+
+      <!-- 需求9: 表格样式 (深色表头 + 斑马纹 + 选中高亮) -->
       <div v-if="!isLoggedIn" class="wl-empty">登录后显示分组</div>
       <div v-else-if="dynLoading" class="wl-empty">按指标获取中...</div>
       <div v-else-if="!stocks.length" class="wl-empty">{{ isDynSelection ? '暂无符合条件的个股' : '搜索添加股票' }}</div>
-      <div v-for="s in stocks" :key="s.code"
-           :class="['wl-item', {selected: selectedStock?.code === s.code}]"
-           @click="selectStock(s)">
-        <div class="wl-name">{{ s.name }}</div>
-        <div class="wl-code">
-          <span :class="{up: s.change_pct > 0, down: s.change_pct < 0}">{{ s.change_pct?.toFixed?.(2) ?? '--' }}%</span>
-          <span class="price">¥{{ s.price?.toFixed?.(2) ?? '--' }}</span>
-          <button v-if="!isDynSelection" class="wl-del" @click.stop="removeWatch(s)">✕</button>
-        </div>
+      <!-- 需求101404-0: 动态表头 (按「添加表头」所选字段渲染; 双击行进详情)
+           需求101505-0: 「图表」模块下只展示 名称/代码/涨跌幅 (wlCols 按当前模块取列) -->
+      <div v-else class="wl-table-wrap">
+        <table class="wl-table">
+          <thead>
+            <tr>
+              <th class="nm fix">名称</th>
+              <th class="cd fix">代码</th>
+              <th v-for="f in wlCols" :key="f"
+                  :class="['num', {txt: isWlText(f)}]">{{ wlFieldLabel(f) }}</th>
+              <th v-if="!isDynSelection && !boardActive" class="op"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in stocks" :key="s.code"
+                :class="{selected: selectedStock?.code === s.code}"
+                @click="onWlRowClick(s)">
+              <td class="name fix">{{ s.name }}</td>
+              <td class="code fix">{{ s.code }}</td>
+              <td v-for="f in wlCols" :key="f"
+                  :class="['num', wlFieldClass(s, f), {spark: isSparkCol(f)}]">
+                <!-- 需求101508-2: 图表左侧个股列表涨幅列展示当日分时缩略图 -->
+                <template v-if="isSparkCol(f)">
+                  <svg v-if="sparkPath(s.code)" class="wl-spark" :class="sparkCls(s.code)"
+                       viewBox="0 0 60 20" preserveAspectRatio="none">
+                    <polyline :points="sparkPath(s.code)"></polyline>
+                  </svg>
+                  <span class="spark-pct">{{ wlFieldText(s, f) }}</span>
+                </template>
+                <template v-else>{{ wlFieldText(s, f) }}</template>
+              </td>
+              <td v-if="!isDynSelection && !boardActive" class="op">
+                <button class="wl-del" @click.stop="removeWatch(s)">✕</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
   </aside>
@@ -103,16 +158,25 @@
   <!-- ============ 主内容区 ============ -->
   <main class="main-content">
 
-    <!-- ===== K线 + 分时 Tab (v-show 保证 ECharts 容器始终在 DOM 且有尺寸) ===== -->
-    <section v-show="activeTab === 'kline'" class="pane kline-pane">
+    <!-- ===== 图表模块: K线 + 分时 (需求7 从自选模块拆分独立展示; v-show 保证 ECharts 容器始终在 DOM 且有尺寸) ===== -->
+    <section v-show="activeTab === 'chart'" class="pane kline-pane">
       <div v-if="selectedStock" class="kline-inner">
         <div class="chart-header">
-          <div class="title">
-            {{ selectedStock.name }}
-            <span class="code" v-if="!selectedStock.isBoard">{{ selectedStock.code }}</span>
-            <span class="board-tag" v-else>板块指数</span>
+          <div class="ch-left">
+            <!-- 需求101501-2: 抽屉按钮 —— 收起/拉开左侧分组个股 -->
+            <button class="drawer-btn" @click="toggleDrawer"
+                    :title="drawerOpen ? '收起分组个股' : '拉出分组个股'">{{ drawerOpen ? '◀' : '▶' }}</button>
+            <div class="title">
+              {{ selectedStock.name }}
+              <span class="code" v-if="!selectedStock.isBoard">{{ selectedStock.code }}</span>
+              <span class="board-tag" v-else>{{ selectedStock.isIndex ? '大盘指数' : '板块指数' }}</span>
+            </div>
+            <!-- 需求101506-2 / 101508-3: 个股/板块/指数均可「加自选 / 取消自选」切换 -->
+            <button class="ch-watch-btn" :class="{on: inWatch}"
+                    @click.stop="toggleCurrentWatch"
+                    :title="inWatch ? '从当前分组取消自选' : '加入当前自选分组'">{{ inWatch ? '★ 取消自选' : '＋ 加自选' }}</button>
           </div>
-          <!-- 板块视图: 指数 + 涨跌 + 区间量额 -->
+          <!-- 板块/指数视图: 指数 + 涨跌 + 区间量额 (保持不变) -->
           <div class="stats" v-if="selectedStock.isBoard">
             <span>最新 <b class="v">{{ boardStats?.close ?? '--' }}</b></span>
             <span>涨跌 <b :class="priceClass(boardStats?.change_pct)">{{ boardStats?.change_pct ?? '--' }}%</b></span>
@@ -122,19 +186,11 @@
             <span>成交量 <b class="v">{{ fmtVol(boardStats?.volume) }}</b></span>
             <span>成交额 <b class="v">{{ fmtMoney(boardStats?.amount) }}</b></span>
           </div>
-          <!-- 个股视图 -->
-          <div class="stats" v-else>
-            <span>今开 <span :class="priceClass(selectedStock.change_pct)">{{ selectedStock.open?.toFixed?.(2) }}</span></span>
-            <span>昨收 {{ selectedStock.prev_close?.toFixed?.(2) }}</span>
-            <span>最高 {{ selectedStock.high?.toFixed?.(2) }}</span>
-            <span>最低 {{ selectedStock.low?.toFixed?.(2) }}</span>
-            <span>成交量 <b class="v">{{ fmtVol(selectedStock.volume) }}</b></span>
-            <span>成交额 <b class="v">{{ fmtMoney(selectedStock.amount) }}</b></span>
-          </div>
+          <!-- 需求101505-0: 图表模块个股信息只展示 名称/代码/涨跌幅 (名称+代码在上方标题, 此处仅涨跌幅) -->
           <div class="big-price" :class="priceClass(selectedStock.isBoard ? boardStats?.change_pct : selectedStock.change_pct)">
             <span v-if="selectedStock.isBoard">指数 {{ boardStats?.close?.toFixed?.(2) ?? '--' }}</span>
-            <span v-else>¥{{ selectedStock.price?.toFixed?.(2) }}</span>
-            <span class="pct">{{ (selectedStock.isBoard ? boardStats?.change_pct : selectedStock.change_pct)?.toFixed?.(2) }}%</span>
+            <span class="pct" v-if="(selectedStock.isBoard ? boardStats?.change_pct : selectedStock.change_pct) != null">{{ (selectedStock.isBoard ? boardStats?.change_pct : selectedStock.change_pct)?.toFixed?.(2) }}%</span>
+            <span class="pct" v-else>--</span>
           </div>
         </div>
 
@@ -149,65 +205,7 @@
           <button v-for="p in klinePeriods" :key="p.key"
                   :class="['btn', 'mini', {active: klinePeriod === p.key}]"
                   @click="setPeriod(p.key)">{{ p.label }}</button>
-          <span class="k-sep"></span>
-          <button class="btn mini" :class="{primary: boardOpen}" @click="toggleBoard">📂 板块</button>
           <span class="ind-tip">已开启 MACD 指标 · 均线 MA5/10/20/30/60/120/250</span>
-        </div>
-
-        <!-- 板块查询面板 (行业/概念) -->
-        <div class="board-panel" v-show="boardOpen">
-          <div class="board-toolbar">
-            <span class="board-label">板块</span>
-            <button :class="['btn','mini',{active: boardKind==='industry'}]" @click="switchBoardKind('industry')">行业</button>
-            <button :class="['btn','mini',{active: boardKind==='concept'}]" @click="switchBoardKind('concept')">概念</button>
-            <span class="board-count">{{ boardName }}</span>
-            <button class="btn mini ghost" @click="loadBoards">刷新</button>
-          </div>
-          <div class="board-cols">
-            <div class="board-col">
-              <div class="board-col-title">板块列表 ({{ boardListCount }})</div>
-              <input class="board-search" v-model="boardKw" placeholder="🔍 搜行业 / 概念板块"
-                     @input="debounceBoardSearch">
-              <div v-if="boardSearching" class="board-empty">搜索中...</div>
-              <div v-else-if="boardLoading && !boardKw" class="board-empty">加载板块中...</div>
-              <div v-else-if="!boardListCount" class="board-empty">{{ boardKw ? '无匹配板块' : '暂无板块数据' }}</div>
-              <div v-for="b in boardList" :key="(b.kind || boardKind) + (b.label || b.name)"
-                   :class="['board-item', {active: boardName === b.name}]"
-                   @click="selectBoard(b, b.kind || boardKind)">
-                <span class="b-name">{{ b.name }}</span>
-                <span class="b-kind" v-if="boardKw">{{ b.kind === 'industry' ? '行业' : '概念' }}</span>
-                <span :class="priceClass(b.pct)">{{ b.pct?.toFixed?.(2) ?? '--' }}%</span>
-                <span class="b-leader" v-if="b.leader && !boardKw">{{ b.leader }}</span>
-              </div>
-            </div>
-            <div class="board-col">
-              <div class="board-col-title" @click="toggleBoardSort" style="cursor:pointer">
-                成分股 ({{ boardStocks.length }}) · 涨跌幅{{ boardSortedAsc ? '↑ 正序' : '↓ 倒序' }}
-              </div>
-              <div class="board-batch" v-if="boardStocks.length">
-                <label class="bb-all"><input type="checkbox" :checked="boardAllSel"
-                       @change="toggleBoardAll($event.target.checked)"> 全选</label>
-                <span class="bb-count">{{ boardSel.length }} 已选</span>
-                <select class="bb-group" v-model="boardAddGroupId">
-                  <option :value="null">默认分组</option>
-                  <option v-for="g in watchGroups" :key="g.id" :value="g.id">{{ g.name }}</option>
-                </select>
-                <button class="btn mini primary" :disabled="!boardSel.length || boardAdding"
-                        @click="batchAddBoardStocks">加入自选</button>
-              </div>
-              <div v-if="boardConsLoading" class="board-empty">加载成分股中...</div>
-              <div v-else-if="!boardName" class="board-empty">← 点选板块查看成分股</div>
-              <div v-else-if="!boardStocks.length" class="board-empty">暂无成分股</div>
-              <div v-for="s in boardStocks" :key="s.code" class="board-stock" @click="selectBoardStock(s)">
-                <input type="checkbox" class="bs-check" :checked="boardSel.includes(s.code)"
-                       @click.stop @change="toggleBoardSel(s.code)">
-                <span class="s-name">{{ s.name }}</span>
-                <span class="s-pct" :class="priceClass(s.pct)">{{ s.pct?.toFixed?.(2) ?? '--' }}%</span>
-                <span class="s-code">{{ s.code }}</span>
-                <span class="s-price" :class="priceClass(s.pct)">{{ s.price?.toFixed?.(2) ?? '--' }}</span>
-              </div>
-            </div>
-          </div>
         </div>
 
         <!-- ECharts 容器: v-show 保证始终 mount 且有尺寸 -->
@@ -235,12 +233,12 @@
 
         <!-- 模拟交易入口 (常驻下单面板, 不绑定当前标的; 面板内含代码/名称搜索) -->
         <div v-if="!selectedStock.isBoard" class="kline-trade">
-          <trade-order-box :active="activeTab === 'kline'"
+          <trade-order-box :active="activeTab === 'chart'"
                            title="行情 · 模拟交易"
                            :code="selectedStock?.code || ''"></trade-order-box>
         </div>
       </div>
-      <div v-else class="empty-hint">← 从左侧搜索或点选股票</div>
+      <div v-else class="empty-hint">← 从左侧分组个股中点选，或搜索股票/板块/指数</div>
     </section>
 
     <!-- ===== 账户管理已下沉为「设置」模块子模块 (见页面底部设置面板) ===== -->
@@ -255,6 +253,11 @@
       <train-pane :active="activeTab === 'train'"></train-pane>
     </section>
 
+    <!-- ===== 看盘 Tab (聚合同花顺/开盘啦结构, 功能储备) ===== -->
+    <section v-show="activeTab === 'watch'" class="pane no-pad">
+      <watch-pane :active="activeTab === 'watch'"></watch-pane>
+    </section>
+
     <!-- ===== 复盘 Tab ===== -->
     <section v-show="activeTab === 'review'" class="pane no-pad">
       <review-pane :active="activeTab === 'review'"></review-pane>
@@ -263,47 +266,72 @@
   </main>
   </div><!-- /.app-body -->
 
-  <!-- ============ 动态分组 规则配置弹层 (多条件 AND) ============ -->
+  <!-- ============ 动态分组 规则配置弹层 (分类Tab + 指标网格 + 已选条件) ============ -->
   <div class="dyn-modal" v-if="dynEditorOpen" @click.self="dynEditorOpen = false">
     <div class="dyn-dialog">
-      <div class="dyn-title">
-        {{ dynEditId ? '编辑动态分组' : '新建动态分组' }}
-        <span v-if="dynEditBuiltin" class="dyn-preset">内置预设 · 只读</span>
+      <!-- 顶部标题栏 (对标图片: 主色导航 + 返回) -->
+      <div class="dyn-head">
+        <button class="dyn-back" @click="dynEditorOpen = false" title="返回">‹</button>
+        <span class="dyn-head-title">{{ dynEditId ? '编辑动态分组' : '新建动态分组' }}</span>
+        <span v-if="dynEditBuiltin" class="dyn-preset">内置 · 只读</span>
       </div>
-      <input v-model="dynName" class="auth-input" placeholder="分组名称 (如: 强势涨停 / 长上影)"
-             :disabled="dynEditBuiltin">
-      <div class="dyn-hint">多条条件之间为「且 (AND)」关系：全部满足的个股才会被收入该分组；每次打开分组实时按最新行情重新获取。</div>
-      <div v-for="(c, i) in dynConds" :key="i" class="dyn-cond">
-        <select v-model="c.metric" @change="onMetricChange(c)" :disabled="dynEditBuiltin">
-          <option v-for="mt in dynMetrics" :key="mt.key" :value="mt.key">{{ mt.label }}</option>
-        </select>
-        <select v-model="c.op" :disabled="dynEditBuiltin">
-          <option v-for="o in dynOpsOf(c.metric)" :key="o" :value="o">{{ opLabel(o) }}</option>
-        </select>
-        <template v-if="c.op === 'between'">
-          <input type="number" class="dyn-val" v-model.number="c.value1" :disabled="dynEditBuiltin">
-          <span class="dyn-unit">~</span>
-          <input type="number" class="dyn-val" v-model.number="c.value2" :disabled="dynEditBuiltin">
-        </template>
-        <template v-else-if="dynIsBool(c.metric)">
-          <select v-model="c.boolVal" :disabled="dynEditBuiltin">
+
+      <div class="dyn-body">
+        <input v-model="dynName" class="dyn-name" placeholder="分组名称 (如: 强势涨停 / 长上影)"
+               :disabled="dynEditBuiltin">
+
+        <!-- 已选条件 (多条件 AND) -->
+        <div class="dyn-sec-title">已选条件 ({{ dynConds.length }})</div>
+        <div v-if="!dynConds.length" class="dyn-sec-empty">从下方指标中点击选择, 可多选 · 全部满足才命中</div>
+        <div v-for="(c, i) in dynConds" :key="i" class="dyn-chip">
+          <span class="dyn-chip-name">{{ dynLabel(c.metric) }}</span>
+          <select v-model="c.op" class="dyn-chip-sel" :disabled="dynEditBuiltin">
+            <option v-for="o in dynOpsOf(c.metric)" :key="o" :value="o">{{ opLabel(o) }}</option>
+          </select>
+          <template v-if="c.op === 'between'">
+            <input type="number" class="dyn-chip-val" v-model.number="c.value1" :disabled="dynEditBuiltin">
+            <span class="dyn-chip-unit">~</span>
+            <input type="number" class="dyn-chip-val" v-model.number="c.value2" :disabled="dynEditBuiltin">
+          </template>
+          <select v-else-if="dynIsBool(c.metric)" v-model="c.boolVal" class="dyn-chip-sel"
+                  :disabled="dynEditBuiltin">
             <option :value="true">是</option>
             <option :value="false">否</option>
           </select>
-        </template>
-        <template v-else>
-          <input type="number" class="dyn-val" v-model.number="c.value" :disabled="dynEditBuiltin">
-        </template>
-        <span class="dyn-unit">{{ dynUnit(c.metric) }}</span>
-        <button class="btn mini danger" :disabled="dynConds.length <= 1 || dynEditBuiltin"
-                @click="removeDynCond(i)">✕</button>
+          <input v-else type="number" class="dyn-chip-val" v-model.number="c.value" :disabled="dynEditBuiltin">
+          <span class="dyn-chip-unit">{{ dynUnit(c.metric) }}</span>
+          <button class="dyn-chip-del" :disabled="dynEditBuiltin" @click="removeDynCond(i)" title="移除">✕</button>
+        </div>
+
+        <!-- 指标分类 Tab -->
+        <div class="dyn-tabs">
+          <button v-for="t in dynTabs" :key="t" :class="['dyn-tab', {active: dynTab === t}]"
+                  @click="dynTab = t">{{ t }}</button>
+        </div>
+
+        <!-- 指标网格 (点击即可加入已选条件) -->
+        <div class="dyn-grid">
+          <button v-for="mt in dynTabMetrics" :key="mt.key"
+                  :class="['dyn-metric', {on: dynMetricSelected(mt.key)}]"
+                  :disabled="dynEditBuiltin" @click="toggleDynMetric(mt.key)">
+            <span v-if="mt.hot" class="dyn-hot">HOT</span>
+            <span class="dyn-metric-label">{{ mt.label }}</span>
+          </button>
+          <div v-if="!dynTabMetrics.length" class="dyn-grid-empty">
+            {{ dynTab === '最近使用' ? '暂无最近使用记录, 用过一次即会出现在这里' : '暂无指标' }}
+          </div>
+        </div>
       </div>
-      <button class="btn mini" :disabled="dynEditBuiltin" @click="addDynCond">＋ 添加条件</button>
+
+      <!-- 底部操作栏 (对标图片: 已选N项 + 主按钮) -->
       <div class="dyn-foot">
-        <span class="dyn-preview">{{ dynPreviewMsg }}</span>
-        <button class="btn mini" :disabled="dynLoading" @click="previewDyn">预览命中</button>
-        <button class="btn mini" @click="dynEditorOpen = false">取消</button>
-        <button class="btn mini primary" :disabled="dynSaving || dynEditBuiltin" @click="saveDyn">保存</button>
+        <span class="dyn-count">◷ 已选 {{ dynConds.length }} 项
+          <em v-if="dynPreviewMsg" class="dyn-msg">{{ dynPreviewMsg }}</em>
+        </span>
+        <button class="btn mini" :disabled="dynSaving || dynEditBuiltin || !dynConds.length"
+                @click="saveDyn">保存</button>
+        <button class="btn mini primary" :disabled="dynLoading || dynEditBuiltin || !dynConds.length"
+                @click="previewDyn">{{ dynPreviewLabel }}</button>
       </div>
     </div>
   </div>
@@ -330,10 +358,10 @@
               <span :class="['auth-tab', { active: authMode === 'register' }]" @click="authMode='register'">注册</span>
             </div>
             <div class="auth-form">
-              <input v-model="authUser" placeholder="用户名 (至少2位)" class="auth-input">
+              <input v-model="authUser" placeholder="账号 (4-20位, 字母开头)" class="auth-input">
               <div class="auth-pass-wrap">
                 <input v-model="authPass" :type="authShowPass ? 'text' : 'password'"
-                       placeholder="密码 (至少6位)" class="auth-input" @keyup.enter="authSubmit">
+                       placeholder="密码 (≥8位, 含大小写/数字/特殊字符至少3类)" class="auth-input" @keyup.enter="authSubmit">
                 <button type="button" class="auth-eye" :title="authShowPass ? '隐藏密码' : '显示密码'"
                         @click="authShowPass = !authShowPass">{{ authShowPass ? '🙈' : '👁' }}</button>
               </div>
@@ -396,12 +424,123 @@
       </div>
     </div>
   </div>
+
+  <!-- ============ 需求101404-0: 「添加表头」弹窗 (图1) ============ -->
+  <div v-if="wlHeaderOpen" class="wl-header-mask" @click.self="cancelWlHeader">
+    <div class="wl-header-panel">
+      <div class="wl-header-bar">
+        <span class="wl-header-t">添加表头 <span class="wl-header-info">ⓘ</span></span>
+        <span class="wl-header-x" @click="cancelWlHeader">✕</span>
+      </div>
+      <div class="wl-header-search">
+        <input v-model="wlHeaderKw" placeholder="🔍 搜索添加">
+      </div>
+      <div class="wl-header-body">
+        <div v-for="c in wlHeaderCats" :key="c.key" class="wl-header-cat">
+          <div class="wl-header-cat-hd">
+            <span>{{ c.label }}</span>
+            <span class="wl-header-toggle" @click="toggleWlCat(c.key)">{{ c.open ? '收起' : '展开' }}</span>
+          </div>
+          <div v-if="c.open" class="wl-header-chips">
+            <span v-for="f in c.fields" :key="f[0]"
+                  :class="['wl-chip', {on: wlHeaderDraft.includes(f[0])}]"
+                  @click="toggleWlField(f[0])">{{ f[1] }}</span>
+            <span v-if="!c.fields.length" class="wl-chip-none">无匹配字段</span>
+          </div>
+        </div>
+      </div>
+      <div class="wl-header-foot">
+        <span class="wl-header-count">已选 {{ wlHeaderDraft.length }} 项</span>
+        <button class="btn mini ghost" @click="resetWlHeader">恢复默认</button>
+        <button class="btn mini ghost" @click="cancelWlHeader">取消</button>
+        <button class="btn mini primary" @click="saveWlHeader">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 需求101404-1: 双击自选股 → 个股详情弹层 (图2) ============ -->
+  <div v-if="sdOpen" class="sd-mask" @click.self="closeStockDetail">
+    <div class="sd-panel">
+      <div class="sd-top">
+        <!-- 左栏: 自选股列表 -->
+        <div class="sd-left">
+          <div class="sd-left-hd">自选股</div>
+          <div class="sd-left-list">
+            <div v-for="s in stocks" :key="s.code"
+                 :class="['sd-left-row', {active: sdStock?.code === s.code}]"
+                 @click="openStockDetail(s)">
+              <span class="nm">{{ s.name }}</span>
+              <span class="cd">{{ s.code }}</span>
+              <span class="pr">{{ s.price?.toFixed?.(2) ?? '--' }}</span>
+              <span class="pc" :class="priceClass(s.change_pct)">
+                {{ s.change_pct != null ? (s.change_pct > 0 ? '+' : '') + s.change_pct.toFixed(2) + '%' : '--' }}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 中栏: 周期 tabs + 主图 -->
+        <div class="sd-mid">
+          <div class="sd-mid-hd">
+            <span class="sd-title">{{ sdStock?.name }} <em>{{ sdStock?.code }}</em></span>
+            <div class="sd-periods">
+              <button v-for="p in sdPeriods" :key="p.key"
+                      :class="['btn', 'mini', {active: sdPeriod === p.key}]"
+                      @click="sdSetPeriod(p.key)">{{ p.label }}</button>
+            </div>
+            <span class="sd-x" @click="closeStockDetail">✕</span>
+          </div>
+          <div class="sd-chart-wrap">
+            <div id="sd-chart" class="sd-chart"></div>
+            <div v-if="sdLoading" class="sd-chart-mask">加载中...</div>
+            <div v-else-if="sdMsg" class="sd-chart-mask">{{ sdMsg }}</div>
+          </div>
+        </div>
+
+        <!-- 右栏: 盘口字段 -->
+        <div class="sd-right">
+          <div class="sd-quote-hd">
+            <div class="sd-q-name">{{ sdStock?.name }}</div>
+            <div class="sd-q-price" :class="priceClass(sdStock?.change_pct)">
+              {{ sdStock?.price?.toFixed?.(2) ?? '--' }}
+            </div>
+            <div class="sd-q-chg" :class="priceClass(sdStock?.change_pct)">
+              <span v-if="sdStock?.price != null && sdStock?.prev_close != null">
+                {{ (sdStock.change_pct > 0 ? '+' : '') + (sdStock.price - sdStock.prev_close).toFixed(2) }}
+              </span>
+              <span>{{ sdStock?.change_pct != null ? (sdStock.change_pct > 0 ? '+' : '') + sdStock.change_pct.toFixed(2) + '%' : '--' }}</span>
+            </div>
+            <span class="sd-q-tag">自选</span>
+          </div>
+          <div class="sd-quote-grid">
+            <div v-for="q in sdQuote" :key="q.k" class="sd-quote-row">
+              <span class="k">{{ q.k }}</span><span class="v">{{ q.v }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 底栏: 指标 tabs + 资讯 tabs -->
+      <div class="sd-bottom">
+        <div class="sd-tab-row">
+          <span v-for="t in sdBottomTabs" :key="t"
+                :class="['sd-tab', {active: sdBottomTab === t}]" @click="sdBottomTab = t">{{ t }}</span>
+        </div>
+        <div class="sd-tab-row news">
+          <span v-for="t in sdNewsTabs" :key="t"
+                :class="['sd-tab', {active: sdNewsTab === t}]" @click="sdNewsTab = t">{{ t }}</span>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
-<script src="indicators.js?v=40"></script>
-<script src="live.js?v=40"></script>
-<script src="train.js?v=40"></script>
-<script src="review.js?v=40"></script>
-<script src="app.js?v=40"></script>
+<script src="preload.js?v=70"></script>
+<script src="indicators.js?v=70"></script>
+<script src="live.js?v=70"></script>
+<script src="train.js?v=70"></script>
+<script src="review.js?v=70"></script>
+<script src="watch.js?v=70"></script>
+<script src="app.js?v=70"></script>
 </body>
 </html>

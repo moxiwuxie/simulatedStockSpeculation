@@ -39,7 +39,25 @@ class Settings(BaseSettings):
     # 模拟模式 - 跳过交易时间校验
     SIMULATION_MODE: bool = True
 
+    # 模拟交易: 是否强制校验交易时间 (关闭后可在非交易时段自由下单, 供联调/演示)
+    ENFORCE_TRADING_TIME: bool = True
+
+    # 同花顺 iFinD MCP 密钥 (真实看盘数据源): 来自 backend/.env 或进程环境变量
+    # 为空时看盘模块回落占位快照
+    IFIND_AUTH_TOKEN: str = ""
+
     model_config = {"env_file": ".env"}
 
 
 settings = Settings()
+
+# 插件/IDE 运行环境可能向进程注入同名占位环境变量 (向导说明文案), 其优先级高于
+# .env 会覆盖真实密钥; 本项目约定密钥配置在 backend/.env, 故此处让 .env 优先。
+try:
+    from dotenv import dotenv_values
+
+    _env_file_token = (dotenv_values(".env").get("IFIND_AUTH_TOKEN") or "").strip()
+    if _env_file_token:
+        settings.IFIND_AUTH_TOKEN = _env_file_token
+except Exception:  # pragma: no cover - 环境缺 dotenv 或 .env 不存在时保持默认行为
+    pass
