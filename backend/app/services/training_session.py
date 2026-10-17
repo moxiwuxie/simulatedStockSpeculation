@@ -94,20 +94,21 @@ CATEGORY_LEVERAGE = {}
 
 # 品类展示名
 CATEGORY_LABELS = {
-    "stock": "股票双盲", "long": "长周期训练",
+    "stock": "股票双盲", "long": "长周期训练", "demon": "妖股训练",
 }
 
-# 训练品类 → 数据源 (A 股日 K: 股票双盲 + 长周期 共用)
+# 训练品类 → 数据源 (A 股日 K: 股票双盲 + 长周期 + 妖股 共用)
 CATEGORY_FETCHERS = {
     "stock": _fetch_stock_kline,
     "long": _fetch_stock_kline,           # 单标的长周期 (双盲), 仅放宽单局根数上限
+    "demon": _fetch_stock_kline,          # 需求101802-0: 妖股训练, 标的从妖股池抽取
 }
 
 # 单局 K 线根数上限 (长周期训练放宽到 1250 根, 其余沿用 250)
-CATEGORY_BARS_CAP = {"stock": 250, "long": 1250}
+CATEGORY_BARS_CAP = {"stock": 250, "long": 1250, "demon": 250}
 
 # 品类默认单局根数 (前端滑块初始值)
-CATEGORY_DEFAULT_BARS = {"stock": 250, "long": 1250}
+CATEGORY_DEFAULT_BARS = {"stock": 250, "long": 1250, "demon": 250}
 
 # 单局最少根数 (与前端滑块下限同口径)
 MIN_BARS = 20
@@ -1419,9 +1420,11 @@ class TrainingManager:
         if code is None:
             # 随机抽取: 内部分级匹配 (优先周期内有涨停 / 有量能异常 / 时间较近)
             # 并避开同账号最近 50 局已用标的 (50 局以内不重复)
+            # 需求101802-0: 妖股训练品类改为从「妖股池」抽取 (涨停/涨幅/振幅综合判定)
             exclude = self._recent_codes(user_id, 50)
+            picker = self._pick_demon_code if category == "demon" else self._pick_random_code
             for _ in range(15):
-                picked = self._pick_random_code(bars_count + 30, exclude=exclude)
+                picked = picker(bars_count + 30, exclude=exclude)
                 if not picked:
                     break
                 cand = picked["code"]
@@ -1535,6 +1538,22 @@ class TrainingManager:
         # 全部探测失败: 退回纯随机 (不校验分时/长度), 由 start() 的重试循环继续筛
         return {"code": random.choice(codes), "klines": [],
                 "limit_up_count": 0, "limit_up_bucket": "", "limit_up_label": ""}
+
+    def _pick_demon_code(self, bars_needed: int = 0,
+                         exclude: Optional[List[str]] = None) -> Optional[dict]:
+        """妖股训练专用抽标 (需求101802-0)
+
+        优先从标的池中抽取「妖股」(涨停次数 / 区间涨幅 / 振幅异常 三项综合判定);
+        池内妖股不足时现场探测, 仍失败则回退分级随机, 保证开局不被卡死。
+        返回结构与 _pick_random_code 一致。
+        """
+        try:
+            hit = _pool.pick_demon(bars_needed, exclude=exclude)
+            if hit:
+                return hit
+        except Exception as e:
+            print(f"[Train] 妖股池抽取失败, 回退分级随机: {e}")
+        return self._pick_random_code(bars_needed, exclude=exclude)
 
     def _recent_codes(self, user_id: str, n: int = 50) -> List[str]:
         """该用户最近 n 局已用过的标的代码 (随机抽标时作为排除集, 50 局以内不重复)"""

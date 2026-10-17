@@ -115,6 +115,71 @@ def has_volume_anomaly(bars: List[dict], window: int = STAT_WINDOW,
     return False
 
 
+# ---------- 妖股判定 (需求101802-0) ----------
+# 妖股统计窗口 (根日K, 约半年): 妖股行情通常集中在近半年内爆发
+DEMON_WINDOW = 120
+# 三项指标命中数达到该值即判定为妖股
+DEMON_MIN_HITS = 2
+# 窗口内涨停次数阈值
+DEMON_LIMIT_UP_MIN = 3
+# 窗口内区间涨幅阈值 (收盘价首尾比)
+DEMON_RANGE_GAIN_MIN = 0.50
+# 单日振幅阈值 (high-low)/前收盘 ≥ 该值记一次「振幅异常」
+DEMON_AMP_MIN = 0.15
+# 振幅异常出现次数阈值
+DEMON_AMP_CNT_MIN = 2
+
+
+def demon_eval(bars: List[dict], pct: float, window: int = DEMON_WINDOW) -> dict:
+    """妖股判定 (需求101802-0): 从「涨停数量 / 区间涨幅 / 振幅异常」三项综合评估
+
+    三项各自达标记 1 次命中, 命中数 >= DEMON_MIN_HITS(默认 2) 判定为妖股;
+    demon_score 为三项归一化后的加权分 (0~100), 用于池内排序展示。
+
+    返回 {"limit_up_count","range_gain","max_amp","amp_cnt","demon_hits",
+          "demon_score","is_demon"}
+    """
+    out = {"limit_up_count": 0, "range_gain": 0.0, "max_amp": 0.0, "amp_cnt": 0,
+           "demon_hits": 0, "demon_score": 0, "is_demon": 0}
+    if not bars or len(bars) < 2:
+        return out
+    seg = bars[-window:] if window and len(bars) > window else bars
+    lu = 0
+    amp_cnt = 0
+    max_amp = 0.0
+    for i in range(1, len(seg)):
+        prev = seg[i - 1].get("close")
+        cur = seg[i].get("close")
+        if not prev or not cur:
+            continue
+        if cur / prev - 1 >= pct - LIMIT_UP_TOL:
+            lu += 1
+        hi, lo = seg[i].get("high"), seg[i].get("low")
+        if hi and lo and prev:
+            amp = (hi - lo) / prev
+            if amp > max_amp:
+                max_amp = amp
+            if amp >= DEMON_AMP_MIN:
+                amp_cnt += 1
+    first = seg[0].get("close") or 0
+    last = seg[-1].get("close") or 0
+    gain = (last / first - 1) if first else 0.0
+    hits = 0
+    if lu >= DEMON_LIMIT_UP_MIN:
+        hits += 1
+    if gain >= DEMON_RANGE_GAIN_MIN:
+        hits += 1
+    if amp_cnt >= DEMON_AMP_CNT_MIN:
+        hits += 1
+    score = (min(1.0, lu / 6.0) * 40
+             + min(1.0, max(0.0, gain) / 1.0) * 35
+             + min(1.0, amp_cnt / 3.0) * 25)
+    out.update({"limit_up_count": lu, "range_gain": round(gain, 4),
+                "max_amp": round(max_amp, 4), "amp_cnt": amp_cnt,
+                "demon_hits": hits, "demon_score": round(score, 1),
+                "is_demon": 1 if hits >= DEMON_MIN_HITS else 0})
+    return out
+
 
 # ---------- 池表 ----------
 
@@ -141,16 +206,32 @@ def _ensure_table() -> None:
             limit_up_count INTEGER DEFAULT 0,
             limit_up_bucket TEXT DEFAULT '',
             vol_anomaly INTEGER DEFAULT 0,
+            is_demon INTEGER DEFAULT 0,
+            demon_score REAL DEFAULT 0,
+            range_gain REAL DEFAULT 0,
+            max_amp REAL DEFAULT 0,
+            amp_cnt INTEGER DEFAULT 0,
             has_intraday INTEGER DEFAULT 0,
             last_close REAL DEFAULT 0,
             stat_date TEXT DEFAULT '',
             updated_at TEXT DEFAULT ''
         )""")
-        # 迁移: 老库补齐 vol_anomaly (成交量异常标记)
+        # 迁移: 老库补齐后续新增统计列
         cols = {r[1] for r in c.execute("PRAGMA table_info(stock_pool)").fetchall()}
-        if "vol_anomaly" not in cols:
-            c.execute("ALTER TABLE stock_pool ADD COLUMN vol_anomaly INTEGER DEFAULT 0")
+        adds = (
+            ("vol_anomaly", "ALTER TABLE stock_pool ADD COLUMN vol_anomaly INTEGER DEFAULT 0"),
+            # 需求101802-0: 妖股判定相关列
+            ("is_demon", "ALTER TABLE stock_pool ADD COLUMN is_demon INTEGER DEFAULT 0"),
+            ("demon_score", "ALTER TABLE stock_pool ADD COLUMN demon_score REAL DEFAULT 0"),
+            ("range_gain", "ALTER TABLE stock_pool ADD COLUMN range_gain REAL DEFAULT 0"),
+            ("max_amp", "ALTER TABLE stock_pool ADD COLUMN max_amp REAL DEFAULT 0"),
+            ("amp_cnt", "ALTER TABLE stock_pool ADD COLUMN amp_cnt INTEGER DEFAULT 0"),
+        )
+        for col, ddl in adds:
+            if col not in cols:
+                c.execute(ddl)
         c.execute("CREATE INDEX IF NOT EXISTS idx_stock_pool_bucket ON stock_pool(limit_up_bucket)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_stock_pool_demon ON stock_pool(is_demon)")
 
 
 def _today() -> str:
@@ -169,18 +250,25 @@ def update_stat(code: str, name: str = "", market: str = "", board: str = "",
         cnt = count_limit_up(bars, pct)
         bk = bucket_of(cnt)
         vol_anom = 1 if has_volume_anomaly(bars) else 0
+        demon = demon_eval(bars, pct)
         last_close = bars[-1].get("close") or 0
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         with _conn() as c:
             c.execute(
                 """INSERT OR REPLACE INTO stock_pool
                    (code,name,market,board,is_kcb,bars_count,limit_up_count,limit_up_bucket,
-                    vol_anomaly,has_intraday,last_close,stat_date,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    vol_anomaly,is_demon,demon_score,range_gain,max_amp,amp_cnt,
+                    has_intraday,last_close,stat_date,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (code, name, market, board, int(is_kcb or 0), len(bars), cnt, bk,
-                 vol_anom, 1 if has_intraday else 0, float(last_close), _today(), now))
+                 vol_anom, demon["is_demon"], demon["demon_score"], demon["range_gain"],
+                 demon["max_amp"], demon["amp_cnt"],
+                 1 if has_intraday else 0, float(last_close), _today(), now))
         return {"code": code, "limit_up_count": cnt, "limit_up_bucket": bk,
                 "vol_anomaly": vol_anom,
+                "is_demon": demon["is_demon"], "demon_score": demon["demon_score"],
+                "range_gain": demon["range_gain"], "max_amp": demon["max_amp"],
+                "amp_cnt": demon["amp_cnt"], "demon_hits": demon["demon_hits"],
                 "limit_up_label": bucket_label(bk), "bars_count": len(bars)}
     except Exception as e:
         print(f"[StockPool] 写入统计失败 {code}: {e}")
@@ -415,4 +503,176 @@ def pick_tiered(bars_needed: int, exclude: Optional[List[str]] = None,
         elif info.get("has_intraday") and t3 is None:
             t3 = info
     return t1 or t2 or t3
+
+
+def pick_demon(bars_needed: int, exclude: Optional[List[str]] = None,
+               fetch_kline: Optional[Callable[[str], List[dict]]] = None,
+               max_probe: int = MAX_PROBE) -> Optional[dict]:
+    """妖股训练专用抽标 (需求101802-0)
+
+    策略:
+      1) 池内 is_demon = 1 且历史足够长/有分时的候选, 按 demon_score 降序随机抽取
+      2) 池无妖股 → 现场探测若干只, 命中妖股优先, 否则回退「有分时」候选
+    返回结构与 pick_code 一致 (额外带 is_demon / demon_score); 抽不到返回 None。
+    """
+    import random
+    if not fetch_kline:
+        from .training_session import _augment_amount, _fetch_stock_kline
+
+        def fetch_kline(c):                              # type: ignore[misc]
+            return _augment_amount(_fetch_stock_kline(c), "stock")
+    ex = set(exclude or [])
+
+    def _as_hit(row: dict, klines: List[dict]) -> dict:
+        bk = row.get("limit_up_bucket") or bucket_of(row.get("limit_up_count") or 0)
+        return {"code": row["code"], "klines": klines,
+                "limit_up_count": row.get("limit_up_count") or 0,
+                "limit_up_bucket": bk, "limit_up_label": bucket_label(bk),
+                "market": row.get("market") or "", "board": row.get("board") or "",
+                "is_kcb": row.get("is_kcb") or 0,
+                "is_demon": 1, "demon_score": row.get("demon_score") or 0}
+
+    # ---- 1) 池内妖股 (按分值降序, 并列随机) ----
+    pool = [r for r in pool_stats()
+            if (r.get("bars_count") or 0) >= bars_needed
+            and r.get("has_intraday") and r.get("is_demon")]
+    pool.sort(key=lambda r: (r.get("demon_score") or 0, r.get("stat_date") or ""),
+              reverse=True)
+    cands = [r for r in pool if r.get("code") not in ex] or pool
+    random.shuffle(cands)
+    for row in cands:
+        try:
+            klines = fetch_kline(row["code"])
+        except Exception:
+            klines = []
+        if klines and len(klines) >= bars_needed:
+            return _as_hit(row, klines)
+
+    # ---- 2) 池内妖股不足 → 复用池内已有候选重算妖股指标 (顺带回填 is_demon) ----
+    # 说明: 池内老行可能是本指标上线前写入的 (is_demon=0), 直接换一批注册表个股探测
+    # 命中率低; 复用池内候选重算可让妖股池自行生长且不重复拉分时 (probe_intraday=False)。
+    rows = [r for r in pool_stats()
+            if (r.get("bars_count") or 0) >= bars_needed and r.get("has_intraday")]
+    rows.sort(key=lambda r: (1 if not r.get("demon_score") else 0,
+                             r.get("limit_up_count") or 0), reverse=True)
+    cands2 = [r for r in rows if r.get("code") not in ex] or rows
+    random.shuffle(cands2)
+    probe_rows = cands2[:max_probe]
+
+    def _re_stat(row: dict) -> Optional[dict]:
+        info = _stat_for(row["code"], fetch_kline, probe_intraday=False)
+        if info:
+            info["has_intraday"] = int(row.get("has_intraday") or 0)
+        return info
+
+    if probe_rows:
+        with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(probe_rows))) as ex_:
+            infos = list(ex_.map(_re_stat, probe_rows))
+        fallback_pool: Optional[dict] = None
+        for info in infos:
+            if not info or (info.get("bars_count") or 0) < bars_needed:
+                continue
+            info["limit_up_label"] = bucket_label(info.get("limit_up_bucket") or "")
+            if info.get("is_demon"):
+                return info
+            if fallback_pool is None and info.get("has_intraday"):
+                fallback_pool = info
+        if fallback_pool:
+            return fallback_pool
+
+    # ---- 3) 池内候选也拉不到 → 现场探测注册表 (命中妖股优先, 其次有分时) ----
+    codes = [c for c in _ledger_codes() if c not in ex] or _ledger_codes()
+    if not codes:
+        return None
+    random.shuffle(codes)
+    probe = codes[:max_probe]
+    with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, max(1, len(probe)))) as ex_:
+        infos = list(ex_.map(lambda c: _stat_for(c, fetch_kline), probe))
+    fallback: Optional[dict] = None
+    for info in infos:
+        if not info or info.get("bars_count", 0) < bars_needed:
+            continue
+        info["limit_up_label"] = bucket_label(info.get("limit_up_bucket") or "")
+        if info.get("is_demon"):
+            return info
+        if fallback is None and info.get("has_intraday"):
+            fallback = info
+    return fallback
+
+
+# ---------- 标的池查询 (需求101802-1) ----------
+
+# 池筛选维度: key → 展示名
+POOL_FILTERS = [
+    ("all", "全部标的"),
+    ("demon", "妖股"),
+    ("limit_up", "有涨停"),
+    ("vol_anomaly", "量能异常"),
+]
+POOL_FILTER_KEYS = [k for k, _ in POOL_FILTERS]
+
+
+def _public_row(r: dict) -> dict:
+    """池行 → 前端展示结构 (字段名与 UI 表格列对齐)"""
+    bk = r.get("limit_up_bucket") or ""
+    return {
+        "code": r.get("code") or "", "name": r.get("name") or "",
+        "market": r.get("market") or "", "board": r.get("board") or "",
+        "bars_count": r.get("bars_count") or 0,
+        "limit_up_count": r.get("limit_up_count") or 0,
+        "limit_up_label": bucket_label(bk),
+        "vol_anomaly": int(r.get("vol_anomaly") or 0),
+        "is_demon": int(r.get("is_demon") or 0),
+        "demon_score": round(float(r.get("demon_score") or 0), 1),
+        "range_gain": round(float(r.get("range_gain") or 0), 4),
+        "max_amp": round(float(r.get("max_amp") or 0), 4),
+        "has_intraday": int(r.get("has_intraday") or 0),
+        "last_close": float(r.get("last_close") or 0),
+        "stat_date": r.get("stat_date") or "",
+    }
+
+
+def pool_query(flt: str = "all", limit: int = 50, offset: int = 0,
+               refresh_days: int = FRESH_DAYS) -> dict:
+    """训练标的池查询 (需求101802-1): 返回当前池内个股 + 筛选维度与总数
+
+    仅返回「未过期」行 (stat_date >= 今日 - refresh_days), 与训练候选口径一致;
+    排序: 妖股优先 → 妖股分值降序 → 涨停次数降序 → 统计日降序。
+    """
+    f = (flt or "all").strip().lower()
+    if f not in POOL_FILTER_KEYS:
+        f = "all"
+    try:
+        limit = max(1, min(int(limit or 50), 200))
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        offset = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    filters = [{"key": k, "label": v} for k, v in POOL_FILTERS]
+    empty = {"total": 0, "filter": f, "filters": filters, "rows": []}
+    try:
+        _ensure_table()
+        cutoff = date.fromordinal(
+            date.today().toordinal() - max(0, refresh_days)).isoformat()
+        extra = {
+            "demon": " AND is_demon = 1",
+            "limit_up": " AND limit_up_count > 0",
+            "vol_anomaly": " AND vol_anomaly = 1",
+        }.get(f, "")
+        where = "stat_date >= ?" + extra
+        order = ("ORDER BY is_demon DESC, demon_score DESC, limit_up_count DESC, "
+                 "stat_date DESC, code ASC")
+        with _conn() as c:
+            total = c.execute(
+                f"SELECT COUNT(*) FROM stock_pool WHERE {where}", (cutoff,)).fetchone()[0]
+            rows = c.execute(
+                f"SELECT * FROM stock_pool WHERE {where} {order} LIMIT ? OFFSET ?",
+                (cutoff, limit, offset)).fetchall()
+        return {"total": int(total), "filter": f, "filters": filters,
+                "rows": [_public_row(dict(r)) for r in rows]}
+    except Exception as e:
+        print(f"[StockPool] 查询池失败: {e}")
+        return empty
 

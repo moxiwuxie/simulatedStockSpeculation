@@ -1279,7 +1279,7 @@ def dyn_groups_preview(req: DynPreviewRequest, user_id: str = Depends(require_us
 # ========== 训练系统 ==========
 
 class TrainStartRequest(BaseModel):
-    category: Literal["stock", "long"] = "stock"
+    category: Literal["stock", "long", "demon"] = "stock"
     bars: int = Field(100, ge=20, le=1250)
     code: Optional[str] = None
     initial_capital: float = Field(100_000.0, ge=10_000)
@@ -1347,6 +1347,18 @@ def train_categories(response: Response):
          "limit_up_weights_default": [1] * len(buckets)}
         for k, v in CATEGORY_LABELS.items()
     ]}
+
+
+@app.get("/api/training/pool")
+def train_pool(filter: str = Query("all"), limit: int = Query(50, ge=1, le=200),
+               offset: int = Query(0, ge=0)):
+    """训练标的池 (需求101802-1): 展示当前池内个股 + 筛选维度
+
+    filter: all / demon(妖股) / limit_up(有涨停) / vol_anomaly(量能异常)
+    仅返回未过期行 (与训练候选口径一致), 供前端弹窗列表展示与选为训练标的。
+    """
+    from .services.stock_pool import pool_query
+    return pool_query(filter, limit, offset)
 
 
 @app.post("/api/training/start")

@@ -87,6 +87,9 @@
                 :class="['chip', { active: form.category === c.key }]"
                 @click="pickCategory(c)">{{ c.label }}</span>
         </div>
+        <div class="cat-hint" v-if="form.category === 'demon'">
+          妖股训练：标的从历史妖股池抽取（涨停次数 / 区间涨幅 / 振幅异常 综合判定）
+        </div>
       </div>
 
       <div class="setup-block">
@@ -179,6 +182,8 @@
       <div class="setup-block actions">
         <button class="btn mini ghost" @click="resetForm">🔄 恢复默认参数</button>
         <button class="btn mini ghost" @click="clearCode">✕ 清空标的 (随机双盲)</button>
+        <button class="btn mini ghost" @click="openPool">📋 训练标的池</button>
+        <span class="help-q" data-tip="查看当前可训练的个股池（含妖股/涨停/量能异常标记），可直接选为指定标的">?</span>
       </div>
     </div>
 
@@ -382,6 +387,59 @@
         <button class="btn primary" @click="restart">🔄 再来一局</button>
       </div>
       <div v-if="savedMsg" class="saved-msg">{{ savedMsg }}</div>
+    </div>
+  </div>
+
+  <!-- ============ 训练标的池 (需求101802-1) ============ -->
+  <div v-if="poolOpen" class="pool-mask" @click.self="closePool">
+    <div class="pool-modal">
+      <div class="pool-head">
+        <span class="pool-title">📋 训练标的池 <span class="sub">当前可训练个股（未过期统计）</span></span>
+        <button class="pool-close" @click="closePool" title="关闭">✕</button>
+      </div>
+      <div class="pool-filters">
+        <span v-for="f in poolFilters" :key="f.key"
+              :class="['pool-chip', { active: poolFilter === f.key }]"
+              @click="pickPoolFilter(f.key)">{{ f.label }}</span>
+        <span class="pool-count">共 {{ poolTotal }} 只</span>
+      </div>
+      <div class="pool-body">
+        <table class="pool-table">
+          <thead>
+            <tr>
+              <th>标的</th><th>涨停</th><th>区间涨幅</th><th>最大振幅</th>
+              <th>量能</th><th>妖股</th><th>分时</th><th>统计日</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in poolRows" :key="r.code">
+              <td class="pool-stock">
+                <span class="p-name">{{ r.name || '—' }}</span>
+                <span class="p-code">{{ r.code }}</span>
+              </td>
+              <td>{{ r.limit_up_count }} 次</td>
+              <td :class="r.range_gain > 0 ? 'up' : (r.range_gain < 0 ? 'down' : '')">{{ poolPct(r.range_gain) }}</td>
+              <td>{{ poolPct(r.max_amp) }}</td>
+              <td><span v-if="r.vol_anomaly" class="pool-tag warn">异常</span><span v-else class="pool-dim">—</span></td>
+              <td><span v-if="r.is_demon" class="pool-tag demon">妖股 {{ r.demon_score }}</span><span v-else class="pool-dim">—</span></td>
+              <td><span v-if="r.has_intraday" class="pool-tag ok">有</span><span v-else class="pool-tag off">无</span></td>
+              <td class="pool-dim">{{ r.stat_date || '—' }}</td>
+              <td><button class="btn mini ghost" @click="usePoolRow(r)">选为标的</button></td>
+            </tr>
+            <tr v-if="!poolRows.length">
+              <td colspan="9" class="pool-empty">
+                {{ poolLoading ? '加载中...' : '池内暂无符合条件的标的（开启训练会自动写入池）' }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="pool-foot">
+        <button v-if="poolHasMore" class="btn mini ghost" :disabled="poolLoading" @click="poolMore">
+          {{ poolLoading ? '加载中...' : '加载更多' }}
+        </button>
+        <span class="pool-tip">点「选为标的」→ 关闭弹窗后自动填入指定标的输入框</span>
+      </div>
     </div>
   </div>
 </div>
@@ -926,6 +984,59 @@
         form.code = ''; form.start_date = '';
         codeKw.value = ''; codeCode.value = ''; codeLabel.value = ''; codeResults.value = []; codeOpen.value = false;
         availHint.value = ''; availKey = ''; dateOpen.value = false;
+      }
+
+      // ===== 需求101802-1: 训练标的池 (弹窗展示池内个股 + 筛选/分页) =====
+      const poolOpen = ref(false);
+      const poolRows = ref([]);
+      const poolTotal = ref(0);
+      const poolFilters = ref([]);
+      const poolFilter = ref('all');
+      const poolLoading = ref(false);
+      const poolOffset = ref(0);
+      const POOL_PAGE = 30;
+      const poolHasMore = computed(function () {
+        return poolRows.value.length < poolTotal.value;
+      });
+      function poolPct(v) {
+        if (v == null) return '--';
+        return (Number(v) * 100).toFixed(2) + '%';
+      }
+      async function loadPool(reset) {
+        poolLoading.value = true;
+        try {
+          if (reset) { poolOffset.value = 0; window.__apiCacheClear('/training/pool'); }
+          const q = '/training/pool?filter=' + encodeURIComponent(poolFilter.value) +
+                    '&limit=' + POOL_PAGE + '&offset=' + poolOffset.value;
+          const res = await api(q, { method: 'GET' }, { httpNoStore: true });
+          poolTotal.value = res.total || 0;
+          poolFilters.value = res.filters || [];
+          const rows = res.rows || [];
+          poolRows.value = reset ? rows : poolRows.value.concat(rows);
+          poolOffset.value = poolRows.value.length;
+        } catch (e) {
+          if (reset) { poolRows.value = []; poolTotal.value = 0; }
+        } finally { poolLoading.value = false; }
+      }
+      function openPool() { poolOpen.value = true; loadPool(true); }
+      function closePool() { poolOpen.value = false; }
+      function pickPoolFilter(k) {
+        if (poolFilter.value === k) return;
+        poolFilter.value = k;
+        loadPool(true);
+      }
+      function poolMore() { loadPool(false); }
+      /** 池内点选 → 设为「指定标的」, 下次开局使用该标的 (关闭弹窗回到配置面板) */
+      function usePoolRow(r) {
+        if (!r || !r.code) return;
+        codeCode.value = r.code;
+        codeLabel.value = (r.name || '') + ' ' + r.code;
+        codeKw.value = codeLabel.value;
+        form.code = r.code;
+        codeResults.value = []; codeOpen.value = false;
+        closePool();
+        notice.value = '已从标的池选择：' + codeLabel.value;
+        loadAvail();
       }
 
       // 需求101604: 开局请求体 (start / prime 必须构造完全一致, 后端靠参数指纹复用预生成数据)
@@ -1613,6 +1724,9 @@
         settle, restart,
         saveStrategy, saveNote, fmt,
         resetForm, clearCode,
+        // 需求101802-1: 训练标的池
+        poolOpen, poolRows, poolTotal, poolFilters, poolFilter, poolLoading,
+        poolHasMore, poolPct, openPool, closePool, pickPoolFilter, poolMore, usePoolRow,
       };
     },
   };
