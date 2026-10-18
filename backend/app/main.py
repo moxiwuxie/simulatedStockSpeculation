@@ -314,11 +314,12 @@ async def _access_collect_and_guard(request: Request, call_next):
 
     if is_api and not admin_api:
         try:
-            if admin_svc.is_blocked(ip):
-                return JSONResponse({"detail": "您的访问已被安全策略限制, 如有疑问请联系管理员"},
-                                    status_code=403)
-            if not admin_svc.check_rate(ip):
-                return JSONResponse({"detail": "请求过于频繁, 请稍后再试"}, status_code=429)
+            if not admin_svc.is_whitelisted(ip):          # 白名单 IP 绕过全部限制
+                if admin_svc.is_blocked(ip):
+                    return JSONResponse({"detail": "您的访问已被安全策略限制, 如有疑问请联系管理员"},
+                                        status_code=403)
+                if not admin_svc.check_rate(ip):
+                    return JSONResponse({"detail": "请求过于频繁, 请稍后再试"}, status_code=429)
         except Exception:
             pass
 
@@ -330,6 +331,8 @@ async def _access_collect_and_guard(request: Request, call_next):
             admin_svc.record_visit(ip, request.method, path,
                                    request.headers.get("user-agent", ""), uid,
                                    response.status_code)
+            if request.method == "POST" and path == "/api/auth/login" and response.status_code >= 400:
+                admin_svc.note_login_fail(ip)             # 登录失败计数 → 达阈值自动封禁
         except Exception:                     # 访问记录失败不得影响正常响应
             pass
     return response
@@ -1863,6 +1866,11 @@ class AdminSecurityRequest(BaseModel):
     settings: dict = Field(default_factory=dict)
 
 
+class AdminWhitelistRequest(BaseModel):
+    ip: str
+    note: str = ""
+
+
 @app.get("/api/admin/overview")
 def admin_overview(_admin: str = Depends(require_admin)):
     """后台总览: 账户统计 + 访问统计 + 封禁数"""
@@ -1978,6 +1986,25 @@ def admin_get_security(_admin: str = Depends(require_admin)):
 @app.post("/api/admin/security")
 def admin_set_security(req: AdminSecurityRequest, _admin: str = Depends(require_admin)):
     return admin_svc.set_security(req.settings)
+
+
+@app.get("/api/admin/whitelist")
+def admin_whitelist(_admin: str = Depends(require_admin)):
+    return admin_svc.list_whitelist()
+
+
+@app.post("/api/admin/whitelist")
+def admin_whitelist_add(req: AdminWhitelistRequest, _admin: str = Depends(require_admin)):
+    try:
+        admin_svc.add_whitelist(req.ip, req.note)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"success": True}
+
+
+@app.delete("/api/admin/whitelist/{ip}")
+def admin_whitelist_remove(ip: str, _admin: str = Depends(require_admin)):
+    return {"success": admin_svc.remove_whitelist(ip)}
 
 
 # ========== 费率工具 ==========

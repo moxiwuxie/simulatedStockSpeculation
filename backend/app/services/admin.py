@@ -1,13 +1,16 @@
-"""系统后台服务 (需求101809) —— 访问IP收集 / 安全管理(网站基础防护功能储备)
+"""系统后台服务 (需求101809) —— 访问IP收集 / 安全管理(网站基础防护)
 
 数据落 ``data/admin.db`` (SQLite, 与 auth.db 分离, 避免与登录写操作争锁):
   visits           访问记录 (ip / method / path / ua / user_id / status / ts)
   ip_blocklist     封禁名单 (ip / reason / created_at / expires_at)
+  ip_whitelist     白名单 (ip / note / created_at) —— 命中即绕过封禁与限流
   security_settings 安全防护配置 (键值对)
 
-安全防护为「基础储备」: 默认不改变现有行为 ——
-  - 速率限制默认关闭 (rate_limit_enabled=0), 开启后按每 IP 每分钟阈值返回 429;
-  - 封禁名单一旦有记录即生效 (命中 IP 的所有 /api 请求返回 403, 后台接口除外)。
+基础防护项 (均可在后台按需开启, 默认不改变现有行为) ——
+  - 速率限制: rate_limit_enabled=1 后按每 IP 每分钟阈值返回 429;
+  - 封禁名单: 一旦有记录即生效 (命中 IP 的所有 /api 请求返回 403, 后台接口除外);
+  - 登录失败自动封禁: login_fail_max>0 时, 同一 IP 10 分钟内失败达阈值即自动封禁;
+  - IP 白名单: 命中白名单的 IP 直接绕过上述全部限制。
 """
 from __future__ import annotations
 import sqlite3
@@ -24,6 +27,8 @@ DEFAULT_SETTINGS = {
     "rate_limit_per_min": "120",    # 每分钟允许请求数
     "ip_block_hours": "24",         # 手动封禁默认时长(小时), 0 = 永久
     "auto_block_max_per_day": "0",  # 单 IP 每日访问上限, 0 = 不限制 (储备)
+    "login_fail_max": "5",          # 同一 IP 10分钟内登录失败达 N 次自动封禁, 0 = 关闭
+    "login_fail_block_hours": "2",  # 登录失败自动封禁时长(小时), 0 = 永久
     "record_visits": "1",           # 1 = 记录访问日志
 }
 
@@ -46,6 +51,8 @@ class AdminService:
         self._db_path.parent.mkdir(exist_ok=True)
         self._mem_lock = threading.Lock()
         self._windows: dict = defaultdict(deque)      # ip -> deque[请求时间戳]
+        self._fails: dict = defaultdict(deque)        # ip -> deque[登录失败时间戳]
+        self._wl_cache = {"ts": 0.0, "ips": set()}    # 白名单内存缓存(30s)
         self._init_db()
 
     # ---------- 基础 ----------
@@ -74,6 +81,11 @@ class AdminService:
                 reason TEXT,
                 created_at TEXT,
                 expires_at TEXT
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS ip_whitelist (
+                ip TEXT PRIMARY KEY,
+                note TEXT,
+                created_at TEXT
             )""")
             c.execute("""CREATE TABLE IF NOT EXISTS security_settings (
                 key TEXT PRIMARY KEY,
@@ -225,6 +237,55 @@ class AdminService:
         return {"blocks": [{"ip": r[0], "reason": r[1] or "", "created_at": r[2] or "",
                             "expires_at": r[3] or ""} for r in rows]}
 
+    # ---------- IP 白名单 (命中即绕过封禁与限流) ----------
+    def _wl_set(self) -> set:
+        """白名单 IP 集合 (内存缓存 30 秒, 避免每请求查库)"""
+        now = time.time()
+        with self._mem_lock:
+            if self._wl_cache["ts"] and now - self._wl_cache["ts"] < 30:
+                return self._wl_cache["ips"]
+        with closing(self._conn()) as conn:
+            rows = conn.execute("SELECT ip FROM ip_whitelist").fetchall()
+        ips = {r[0] for r in rows if r[0]}
+        with self._mem_lock:
+            self._wl_cache = {"ts": now, "ips": ips}
+        return ips
+
+    def _wl_invalidate(self):
+        with self._mem_lock:
+            self._wl_cache["ts"] = 0.0
+
+    def is_whitelisted(self, ip: str) -> bool:
+        ip = (ip or "").strip()
+        return bool(ip) and ip in self._wl_set()
+
+    def add_whitelist(self, ip: str, note: str = "") -> bool:
+        ip = (ip or "").strip()
+        if not ip:
+            raise ValueError("IP 不能为空")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with closing(self._conn()) as conn:
+            conn.execute(
+                "INSERT INTO ip_whitelist (ip, note, created_at) VALUES (?,?,?) "
+                "ON CONFLICT(ip) DO UPDATE SET note = excluded.note",
+                (ip, (note or "")[:200], now))
+            conn.commit()
+        self._wl_invalidate()
+        return True
+
+    def remove_whitelist(self, ip: str) -> bool:
+        with closing(self._conn()) as conn:
+            n = conn.execute("DELETE FROM ip_whitelist WHERE ip = ?", ((ip or "").strip(),)).rowcount
+            conn.commit()
+        self._wl_invalidate()
+        return n > 0
+
+    def list_whitelist(self) -> dict:
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                "SELECT ip, note, created_at FROM ip_whitelist ORDER BY created_at DESC").fetchall()
+        return {"whitelist": [{"ip": r[0], "note": r[1] or "", "created_at": r[2] or ""} for r in rows]}
+
     # ---------- 安全防护配置 ----------
     def get_security(self) -> dict:
         with closing(self._conn()) as conn:
@@ -271,6 +332,39 @@ class AdminService:
                 for k in [k for k, dq in self._windows.items() if not dq]:
                     self._windows.pop(k, None)
         return True
+
+    # ---------- 登录失败自动封禁 ----------
+    def note_login_fail(self, ip: str):
+        """记录一次登录失败; 同一 IP 10 分钟内累计达阈值时自动封禁"""
+        ip = (ip or "").strip()
+        if not ip or self.is_whitelisted(ip):
+            return
+        sec = self.get_security()
+        try:
+            maxf = int(sec.get("login_fail_max") or 0)
+        except ValueError:
+            maxf = 0
+        if maxf <= 0:
+            return
+        now = time.time()
+        with self._mem_lock:
+            q = self._fails[ip]
+            while q and now - q[0] > 600:           # 10 分钟滑动窗口
+                q.popleft()
+            q.append(now)
+            cnt = len(q)
+            if len(self._fails) > 8000:
+                for k in [k for k, dq in self._fails.items() if not dq]:
+                    self._fails.pop(k, None)
+        if cnt >= maxf:
+            try:
+                hours = int(sec.get("login_fail_block_hours") or 0)
+            except ValueError:
+                hours = 0
+            if not self.is_blocked(ip):
+                self.block_ip(ip, f"登录失败 {cnt} 次自动封禁", hours)
+            with self._mem_lock:
+                self._fails.pop(ip, None)
 
 
 admin_svc = AdminService()

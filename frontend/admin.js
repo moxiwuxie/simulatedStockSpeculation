@@ -208,7 +208,7 @@
   <!-- ===== 安全管理 ===== -->
   <div v-show="sub === 'security'" class="adm-body">
     <div class="adm-panel">
-      <div class="adm-panel-head">安全防护配置 <i>基础防护储备 · 默认不改变现有行为</i></div>
+      <div class="adm-panel-head">安全防护配置 <i>基础安全防护 · 防护项可逐项开启</i></div>
       <div class="adm-form">
         <label class="adm-field">
           <span>访问日志记录</span>
@@ -233,10 +233,37 @@
           <input class="adm-input" type="number" min="0" v-model="sec.ip_block_hours">
           <i class="adm-hint">0 = 永久封禁</i>
         </label>
+        <label class="adm-field">
+          <span>登录失败自动封禁阈值</span>
+          <input class="adm-input" type="number" min="0" v-model="sec.login_fail_max">
+          <i class="adm-hint">10 分钟内失败达该次数即自动封禁 IP · 0 = 关闭</i>
+        </label>
+        <label class="adm-field">
+          <span>自动封禁时长(小时)</span>
+          <input class="adm-input" type="number" min="0" v-model="sec.login_fail_block_hours">
+          <i class="adm-hint">0 = 永久封禁</i>
+        </label>
         <div class="adm-form-foot">
           <button class="adm-btn" @click="saveSecurity" :disabled="loading">保存配置</button>
           <span v-if="secMsg" class="adm-msg">{{ secMsg }}</span>
         </div>
+      </div>
+    </div>
+
+    <div class="adm-panel">
+      <div class="adm-panel-head">IP 白名单 <i>{{ whitelist.length }} 个 · 白名单 IP 绕过封禁与限流</i></div>
+      <div class="adm-toolbar">
+        <input class="adm-input" v-model="wlIp" placeholder="输入要加入白名单的 IP">
+        <input class="adm-input adm-input-sm" v-model="wlNote" placeholder="备注(可选)">
+        <button class="adm-btn" @click="addWhitelist">加入白名单</button>
+      </div>
+      <div class="adm-list">
+        <div v-for="w in whitelist" :key="w.ip" class="adm-list-row">
+          <span class="adm-strong">{{ w.ip }}</span>
+          <span class="adm-ellip adm-dim">{{ w.note || '无备注' }} · {{ w.created_at }}</span>
+          <span class="adm-row-ops"><button class="adm-mini" @click="delWhitelist(w.ip)">移出</button></span>
+        </div>
+        <div v-if="!whitelist.length" class="adm-empty">当前无白名单记录</div>
       </div>
     </div>
 
@@ -287,9 +314,11 @@
       // 安全
       const sec = reactive({ record_visits: '1', rate_limit_enabled: '0',
                              rate_limit_per_min: '120', ip_block_hours: '24',
-                             auto_block_max_per_day: '0' });
+                             auto_block_max_per_day: '0',
+                             login_fail_max: '5', login_fail_block_hours: '2' });
       const secMsg = ref(''); const blocks = ref([]);
       const blkIp = ref(''); const blkReason = ref(''); const blkHours = ref('');
+      const whitelist = ref([]); const wlIp = ref(''); const wlNote = ref('');
 
       function guard(fn) {
         return async (...a) => {
@@ -327,11 +356,15 @@
       const loadSecurity = guard(async () => {
         const d = await api('/admin/security');
         Object.assign(sec, d || {});
-        await loadBlocks();
+        await Promise.all([loadBlocks(), loadWhitelist()]);
       });
       const loadBlocks = guard(async () => {
         const d = await api('/admin/blocks');
         blocks.value = d.blocks || [];
+      });
+      const loadWhitelist = guard(async () => {
+        const d = await api('/admin/whitelist');
+        whitelist.value = d.whitelist || [];
       });
 
       // 账户操作
@@ -376,6 +409,17 @@
         await api(`/admin/blocks/${encodeURIComponent(ip)}`, { method: 'DELETE' });
         await Promise.all([loadBlocks(), loadIps(ipOffset.value), loadOverview()]);
       });
+      const addWhitelist = guard(async () => {
+        if (!wlIp.value.trim()) { err.value = '请输入要加入白名单的 IP'; return; }
+        await api('/admin/whitelist', { method: 'POST', body: JSON.stringify({
+          ip: wlIp.value.trim(), note: wlNote.value.trim() }) });
+        wlIp.value = ''; wlNote.value = '';
+        await loadWhitelist();
+      });
+      const delWhitelist = guard(async (ip) => {
+        await api(`/admin/whitelist/${encodeURIComponent(ip)}`, { method: 'DELETE' });
+        await loadWhitelist();
+      });
       const clearVisits = guard(async () => {
         if (!confirm('确认清空全部历史访问日志? 该操作不可恢复。')) return;
         await api('/admin/visits?days=0', { method: 'DELETE' });
@@ -419,9 +463,10 @@
         ipMode, ips, ipTotal, ipOffset, ipPageSize, ipOrder,
         visits, vTotal, vOffset, vPageSize, vIp,
         sec, secMsg, blocks, blkIp, blkReason, blkHours,
-        loadOverview, loadUsers, loadIps, loadVisits, loadSecurity, loadBlocks,
+        whitelist, wlIp, wlNote,
+        loadOverview, loadUsers, loadIps, loadVisits, loadSecurity, loadBlocks, loadWhitelist,
         setStatus, setRole, resetPwd, delUser,
-        quickBlock, doBlock, unblock, clearVisits, saveSecurity, refreshAll,
+        quickBlock, doBlock, unblock, addWhitelist, delWhitelist, clearVisits, saveSecurity, refreshAll,
         fmt, pctOf,
       };
     },
