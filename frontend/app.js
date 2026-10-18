@@ -118,14 +118,17 @@ const app = createApp({
               tip: '模拟交易：用真实行情做零资金风险的下单演练，含持仓 / 委托 / 成交流水与盈亏统计。' },
             { id: 'kline', label: '自选', icon: '⭐', cls: 'kline',
               tip: '自选：分组管理关注的个股 / 板块 / 指数，单击选中、双击看详情；支持动态分组按指标实时筛选。' },
-            { id: 'chart', label: '图表', icon: '📈', cls: 'kline',
-              tip: '图表：K 线 + 分时 + 指标叠加，可切换周期，左侧抽屉切换分组个股。' },
-            { id: 'watch', label: '看盘', icon: '📡', cls: '',
-              tip: '看盘：全市场快照与板块 / 指数全景，快速发现当日强弱方向。' },
+            // 需求101804-2: 「图表」模块文案 → 「行情」
+            { id: 'chart', label: '行情', icon: '📈', cls: 'kline',
+              tip: '行情：K 线 + 分时 + 指标叠加，可切换周期，左侧抽屉切换分组个股。' },
+            // 需求101804-3: 「看盘」模块文案 → 「盘面」
+            { id: 'watch', label: '盘面', icon: '📡', cls: '',
+              tip: '盘面：全市场快照与板块 / 指数全景，快速发现当日强弱方向。' },
             { id: 'review', label: '复盘', icon: '📊', cls: '',
               tip: '复盘：训练与模拟交易的成绩统计、成长曲线与历史记录回顾。' },
         ];
-        const activeTab = ref('kline');
+        // 需求101804-0: 系统界面默认定位到训练模块
+        const activeTab = ref('train');
         /** 需求101803-0: 模块页面右上角「?」的说明文案 (取自 tab.tip) */
         function tabTip(id) {
             const t = tabs.find(x => x.id === id);
@@ -269,10 +272,10 @@ const app = createApp({
               desc: '从「模拟交易」进入：使用真实行情做零资金风险的买卖委托，先选资金体系，再搜索标的、填价格与数量下单；账户资金 / 持仓 / 委托 / 成交流水实时更新，盈亏与风控指标一目了然。' },
             { icon: '⭐', title: '自选 · 分组管理关注的标的', tab: 'kline',
               desc: '在「自选」中按分组管理个股 / 板块 / 指数，单击选中、双击看详情；可新建自选分组，或用动态分组按指标实时筛选；也支持从 txt/csv/tsv/json 文件导入自选。' },
-            { icon: '📈', title: '图表 · K 线与分时', tab: 'chart',
-              desc: '从「图表」进入：查看选中标的的 K 线 + 分时 + 指标(MACD/均线)，可切换周期与单根查看；左侧抽屉可收起 / 拉出分组个股，板块与指数有专属视图，右侧常驻模拟交易下单面板。' },
-            { icon: '📡', title: '看盘 · 全市场快照', tab: 'watch',
-              desc: '「看盘」聚合同花顺 / 开盘啦结构：国内指数、日韩美股、市场宽度、异动板块与昨日涨停股一屏看清当日强弱，点击可跳转到「图表」查看。' },
+            { icon: '📈', title: '行情 · K 线与分时', tab: 'chart',
+              desc: '从「行情」进入：查看选中标的的 K 线 + 分时 + 指标(MACD/均线)，可切换周期与单根查看；左侧抽屉可收起 / 拉出分组个股，板块与指数有专属视图，右侧常驻模拟交易下单面板。' },
+            { icon: '📡', title: '盘面 · 全市场快照', tab: 'watch',
+              desc: '「盘面」聚合同花顺 / 开盘啦结构：国内指数、日韩美股、市场宽度、异动板块与昨日涨停股一屏看清当日强弱，点击可跳转到「行情」查看。' },
             { icon: '📊', title: '复盘 · 回顾每一步成绩', tab: 'review',
               desc: '「复盘」按「训练 / 模拟交易」双子页汇总成绩统计、成长曲线、胜率与盈亏分布，支持按品类 / 战法 / 时间维度筛选历史明细。' },
         ];
@@ -328,15 +331,15 @@ const app = createApp({
                       '持仓浮动盈亏、可用资金随行情实时刷新，含佣金 / 印花税 / 过户费。',
                   ]},
               ]},
-            { id: 'watch', icon: '📡', title: '自选 · 图表 · 看盘 · 复盘', desc: '行情浏览与账号维度的记录回顾。',
+            { id: 'watch', icon: '📡', title: '自选 · 行情 · 盘面 · 复盘', desc: '行情浏览与账号维度的记录回顾。',
               sections: [
-                  { h: '自选与图表', items: [
-                      '自选支持分组，单击选中、双击看个股详情；动态分组按指标实时筛选。',
-                      '图表展示 K 线 + 分时 + 指标，可切换周期、叠加指标。',
+                  { h: '自选与行情', items: [
+                      '自选支持分组，单击选中、双击看个股详情；分组标签上的 ✕ 可删除该分组（默认分组「自选」除外）；动态分组按指标实时筛选。',
+                      '行情展示 K 线 + 分时 + 指标，可切换周期、叠加指标。',
                   ]},
-                  { h: '看盘', items: [
+                  { h: '盘面', items: [
                       '全市场快照与板块 / 指数全景，快速识别当日强弱。',
-                      '点击指数 / 板块 / 个股可跳转到「图表」查看。',
+                      '点击指数 / 板块 / 个股可跳转到「行情」查看。',
                   ]},
                   { h: '复盘', items: [
                       '按品类 / 战法 / 时间维度统计训练与模拟交易成绩。',
@@ -1105,17 +1108,18 @@ const app = createApp({
             await refreshWatch();
         }
 
-        async function delGroup() {
-            if (watchGroupId.value == null) return;
-            if (isDynSelection.value) {                 // 动态分组走独立删除
-                await deleteDynGroup(currentDynGroupId.value);
-                return;
-            }
-            if (watchGroupId.value === NONE_GROUP) return;   // 「无」为浏览视图, 不可删
+        // ---------- 需求101804-1: 自选分组标签上的 ✕ 删除入口 ----------
+        /** 静态分组: 默认分组「自选」不可删 */
+        function canDelGroupById(id) {
+            const g = watchGroups.value.find(x => x.id === id);
+            return !!g && g.name !== '自选';
+        }
+        async function delGroupById(id) {
+            if (!canDelGroupById(id)) return;
             try {
-                await api('/watchlist/group/' + watchGroupId.value, { method: 'DELETE' });
+                await api('/watchlist/group/' + id, { method: 'DELETE' });
             } catch(e) { console.warn('删除分组失败:', e.message); }
-            watchGroupId.value = null;
+            if (watchGroupId.value === id) watchGroupId.value = null;
             await refreshWatch();
         }
 
@@ -1934,12 +1938,8 @@ const app = createApp({
             ? watchGroupId.value.slice(DYN_PREFIX.length) : null);
         const currentDynGroup = computed(() =>
             dynGroups.value.find(g => dynKey(g.id) === watchGroupId.value) || null);
-        const canDeleteGroup = computed(() => {
-            if (isDynSelection.value) return !!currentDynGroup.value && !currentDynGroup.value.builtin;
-            if (watchGroupId.value === NONE_GROUP || watchGroupId.value == null) return false;
-            const g = watchGroups.value.find(x => x.id === watchGroupId.value);
-            return !!g && g.name !== '自选';           // 默认分组「自选」不可删
-        });
+        // 需求101804-1: 分组删除改由「分组标签上的 ✕」承担 (静态走 canDelGroupById / delGroupById,
+        // 动态走 deleteDynGroup, 内置预设不可删); 原右上角「🗑 删除当前分组」入口已移除
 
         async function loadDynGroups() {
             if (!isLoggedIn.value) { dynGroups.value = []; return; }
@@ -2120,7 +2120,8 @@ const app = createApp({
         async function deleteDynGroup(id) {
             try { await api('/dyn-groups/' + id, { method: 'DELETE' }); }
             catch(e) { console.warn('删除动态分组失败:', e.message); }
-            watchGroupId.value = null;
+            // 需求101804-1: 删除的是非当前分组时不改变当前选择
+            if (watchGroupId.value === dynKey(id)) watchGroupId.value = null;
             await loadDynGroups();
             await refreshWatch();
         }
@@ -2230,9 +2231,9 @@ const app = createApp({
             watchList, stocks, watchGroups, watchGroupId, newGroupName, watchTitle,
             NONE_GROUP, watchOverview, grpPct, loadWatchOverview,
             newGroupOpen, newStaticOpen, toggleNewGroup, startNewStatic, startNewDyn,
-            switchGroup, addGroup, delGroup, removeWatch, reloadWatchView,
+            switchGroup, addGroup, delGroupById, canDelGroupById, removeWatch, reloadWatchView,
             // 动态分组 (按指标实时获取)
-            dynGroups, dynKey, isDynSelection, currentDynGroup, canDeleteGroup, dynLoading,
+            dynGroups, dynKey, isDynSelection, currentDynGroup, deleteDynGroup, dynLoading,
             dynEditorOpen, dynEditId, dynEditBuiltin, dynName, dynConds, dynMetrics,
             dynPreviewMsg, dynSaving, dynTab, dynTabs, dynTabMetrics, dynPreviewLabel,
             dynLabel, dynMetricSelected,

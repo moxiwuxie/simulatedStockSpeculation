@@ -32,7 +32,7 @@
 <div class="watch-wrap">
 
   <div class="watch-head">
-    <span class="watch-title">📡 实时看盘 <span class="sub">聚合同花顺 · 开盘啦 · 自有看盘界面</span></span>
+    <span class="watch-title">📡 实时盘面 <span class="sub">聚合同花顺 · 开盘啦 · 自有盘面界面</span></span>
     <span class="watch-meta" v-if="data">更新 {{ (data.updated_at || '').slice(11, 16) }}</span>
     <button class="btn mini ghost" :disabled="loading" @click="load">{{ loading ? '⏳ 刷新中' : '🔄 刷新' }}</button>
   </div>
@@ -169,7 +169,7 @@
     </div>
   </template>
 
-  <div v-else-if="loading" class="watch-empty">⏳ 正在加载看盘数据...</div>
+  <div v-else-if="loading" class="watch-empty">⏳ 正在加载盘面数据...</div>
 </div>
 `,
     setup(props) {

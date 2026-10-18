@@ -1136,6 +1136,17 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 .wl-tab b { font-weight: 600; font-size: 11.5px; }
 .wl-tab b.up { color: var(--up); }
 .wl-tab b.down { color: var(--down); }
+/* 需求101804-1: 分组标签内的删除入口 (✕), 默认分组「自选」与动态内置预设不显示 */
+.wl-tab-x {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  width: 15px; height: 15px; border-radius: 50%;
+  font-style: normal; font-size: 10px; line-height: 1;
+  color: inherit; opacity: 0.5; cursor: pointer;
+  transition: opacity var(--trans), background var(--trans);
+}
+.wl-tab-x:hover { opacity: 1; background: var(--border); }
+.wl-tab.active .wl-tab-x { opacity: 0.7; }
+.wl-tab.active .wl-tab-x:hover { opacity: 1; background: var(--panel); }
 .wl-tabs-ops { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; }
 .wl-icon-btn {
   width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center;
@@ -1143,7 +1154,6 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   color: var(--text-dim); font-size: 12px; cursor: pointer; padding: 0;
 }
 .wl-icon-btn:hover { color: var(--text); border-color: var(--brand); }
-.wl-icon-btn.danger:hover { color: var(--down); border-color: var(--down); }
 .wl-newgrp-menu {
   display: flex; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--border);
 }

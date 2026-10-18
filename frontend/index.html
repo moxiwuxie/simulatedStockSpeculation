@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>历史回放交易系统</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="style.css?v=73">
+<link rel="stylesheet" href="style.css?v=74">
 <!-- Vue 3 global build (包含 template compiler) -->
-<script src="vendor/vue.global.js?v=73"></script>
+<script src="vendor/vue.global.js?v=74"></script>
 <!-- ECharts -->
-<script src="vendor/echarts.min.js?v=73"></script>
+<script src="vendor/echarts.min.js?v=74"></script>
 </head>
 <body>
 
@@ -77,10 +77,14 @@
             <b v-if="grpPct(g).pct != null" :class="priceClass(grpPct(g).pct)">
               {{ grpPct(g).pct > 0 ? '+' : '' }}{{ grpPct(g).pct.toFixed(2) }}%
             </b>
+            <!-- 需求101804-1: 分组标签上的删除入口 (默认分组「自选」不显示) -->
+            <i v-if="canDelGroupById(g.id)" class="wl-tab-x" title="删除该分组"
+               @click.stop="delGroupById(g.id)">✕</i>
           </span>
           <span v-for="g in dynGroups" :key="'d' + g.id"
                 :class="['wl-tab', 'dyn', {active: watchGroupId === dynKey(g.id)}]"
-                @click="switchGroup(dynKey(g.id))">⚡ {{ g.name }}</span>
+                @click="switchGroup(dynKey(g.id))">⚡ {{ g.name }}<i v-if="!g.builtin"
+                class="wl-tab-x" title="删除该动态分组" @click.stop="deleteDynGroup(g.id)">✕</i></span>
           <span :class="['wl-tab', 'none', {active: watchGroupId === NONE_GROUP}]"
                 @click="switchGroup(NONE_GROUP)">无</span>
         </div>
@@ -89,7 +93,7 @@
           <button class="wl-icon-btn" title="新建分组" @click="toggleNewGroup">＋</button>
           <button class="wl-icon-btn" title="刷新" @click="reloadWatchView(true)">🔄</button>
           <button class="wl-icon-btn" title="从 txt/csv/tsv/json 文件导入自选" @click="triggerImport">📥</button>
-          <button class="wl-icon-btn danger" v-if="canDeleteGroup" title="删除当前分组" @click="delGroup()">🗑</button>
+          <!-- 需求101804-1: 「🗑 删除当前分组」已移除, 删除入口改为分组标签上的 ✕ -->
           <input ref="importFile" type="file" accept=".txt,.csv,.tsv,.json" style="display:none" @change="onImportFile">
         </div>
       </div>
@@ -604,12 +608,12 @@
   </div>
 </div>
 
-<script src="preload.js?v=73"></script>
-<script src="indicators.js?v=73"></script>
-<script src="live.js?v=73"></script>
-<script src="train.js?v=73"></script>
-<script src="review.js?v=73"></script>
-<script src="watch.js?v=73"></script>
-<script src="app.js?v=73"></script>
+<script src="preload.js?v=74"></script>
+<script src="indicators.js?v=74"></script>
+<script src="live.js?v=74"></script>
+<script src="train.js?v=74"></script>
+<script src="review.js?v=74"></script>
+<script src="watch.js?v=74"></script>
+<script src="app.js?v=74"></script>
 </body>
 </html>
