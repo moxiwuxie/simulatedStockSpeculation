@@ -111,7 +111,7 @@ const app = createApp({
     setup() {
         // ---------- 响应式状态 ----------
         // 需求101801-1: tip = 入口「?」悬浮提示文案
-        const tabs = [
+        const baseTabs = [
             { id: 'train', label: '训练', icon: '🎯', cls: 'train',
               tip: '零风险盘感训练：逐根 K 线推进，每根做【买入/卖出/观望】决策，结束自动结算并于复盘揭晓标的与盈亏。' },
             { id: 'live', label: '模拟交易', icon: '💹', cls: 'live',
@@ -127,11 +127,16 @@ const app = createApp({
             { id: 'review', label: '复盘', icon: '📊', cls: '',
               tip: '复盘：训练与模拟交易的成绩统计、成长曲线与历史记录回顾。' },
         ];
+        // 需求101809: 管理员额外看到「后台」Tab (账户管理 / 访问IP / 安全防护)
+        const ADMIN_TAB = { id: 'admin', label: '后台', icon: '🛡', cls: '',
+            tip: '后台：账户管理、访问 IP 收集与统计、网站基础安全防护（封禁名单 / 速率限制）。' };
+        const tabs = computed(() =>
+            (user.value && user.value.role === 'admin') ? [...baseTabs, ADMIN_TAB] : baseTabs);
         // 需求101804-0: 系统界面默认定位到训练模块
         const activeTab = ref('train');
         /** 需求101803-0: 模块页面右上角「?」的说明文案 (取自 tab.tip) */
         function tabTip(id) {
-            const t = tabs.find(x => x.id === id);
+            const t = tabs.value.find(x => x.id === id);
             return t ? t.tip : '';
         }
 
@@ -479,7 +484,7 @@ const app = createApp({
                 const me = await api('/auth/me');
                 if (!me.logged_in) { user.value = null; needBindPhone.value = false; notifyAuth(); return; }
                 user.value = { user_id: me.user_id, username: me.username,
-                               phone: me.phone || '', email: me.email || '' };
+                               phone: me.phone || '', email: me.email || '', role: me.role || 'user' };
                 localStorage.setItem('auth_user', JSON.stringify(user.value));
                 needBindPhone.value = !me.phone_bound;
             } catch (e) {
@@ -516,7 +521,7 @@ const app = createApp({
                 const res = await api(path, { method: 'POST', body: JSON.stringify(body) });
                 localStorage.setItem('auth_token', res.token);
                 user.value = { user_id: res.user_id, username: res.username,
-                               phone: res.phone || '', email: res.email || '' };
+                               phone: res.phone || '', email: res.email || '', role: res.role || 'user' };
                 localStorage.setItem('auth_user', JSON.stringify(user.value));
                 needBindPhone.value = !!res.need_bind_phone;
                 authPass.value = '';
@@ -548,7 +553,7 @@ const app = createApp({
                     phone: authPhone.value.trim(), email: authEmail.value.trim(),
                 }) });
                 user.value = { user_id: p.user_id, username: p.username,
-                               phone: p.phone || '', email: p.email || '' };
+                               phone: p.phone || '', email: p.email || '', role: p.role || 'user' };
                 localStorage.setItem('auth_user', JSON.stringify(user.value));
                 needBindPhone.value = false;
                 authPhone.value = ''; authEmail.value = '';
@@ -2284,5 +2289,7 @@ if (window.ReviewPane) app.component('review-pane', window.ReviewPane);
 if (window.LivePane) app.component('live-pane', window.LivePane);
 if (window.TradeOrderBox) app.component('trade-order-box', window.TradeOrderBox);
 if (window.WatchPane) app.component('watch-pane', window.WatchPane);
+// 需求101809: 系统后台
+if (window.AdminPane) app.component('admin-pane', window.AdminPane);
 
 app.mount('#app');

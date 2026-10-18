@@ -11,7 +11,8 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, date
 from typing import Literal, Optional, List
-from fastapi import FastAPI, HTTPException, Query, Header, Depends, Response
+from fastapi import FastAPI, HTTPException, Query, Header, Depends, Response, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
@@ -23,6 +24,7 @@ from .services.matching import MatchingEngine
 from .services.account import AccountManager
 from .services.live_trade import LiveTradeManager
 from .services.auth import auth_svc
+from .services.admin import admin_svc
 from .data.stock_registry import StockRegistry
 from .core.config import settings
 
@@ -124,6 +126,17 @@ def require_user_id_or_login(authorization: str = Header(default="")) -> str:
     user = auth_svc.get_user(token) if token else None
     if not user:
         raise HTTPException(401, "请先登录")
+    return user["user_id"]
+
+
+def require_admin(authorization: str = Header(default="")) -> str:
+    """需求101809: 系统后台接口 —— 需登录且具备管理员角色"""
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    user = auth_svc.get_user(token) if token else None
+    if not user:
+        raise HTTPException(401, "请先登录")
+    if not auth_svc.is_admin(user["user_id"]):
+        raise HTTPException(403, "需要管理员权限")
     return user["user_id"]
 
 
@@ -264,6 +277,62 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
 # 需求101702: 经 ngrok 等低速隧道访问时, 大体积 JSON (全市场快照 795KB / 看盘全景 / 板块K线)
 # 不压缩导致传输极慢。此处对 /api 响应启用 gzip; 需客户端带 Accept-Encoding (代理不再剥离该头)。
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+
+# ========== 需求101809: 访问IP收集 + 安全防护 (基础储备) ==========
+
+def _client_ip(request: Request) -> str:
+    """取真实客户端 IP: 优先 X-Forwarded-For (反代透传), 其次 X-Real-IP, 最后对端地址"""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    xr = request.headers.get("x-real-ip", "")
+    if xr:
+        return xr.strip()
+    return request.client.host if request.client else ""
+
+
+def _token_user_id(authorization: str) -> str:
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    if not token:
+        return ""
+    user = auth_svc.get_user(token)
+    return user["user_id"] if user else ""
+
+
+@app.middleware("http")
+async def _access_collect_and_guard(request: Request, call_next):
+    """收集访问 IP 并执行基础防护 (封禁名单 / 速率限制)
+
+    说明: 后台接口 /api/admin/* 自身不在防护/收集范围内 —— 既避免管理端刷新时污染
+    访问日志, 也保证被封禁的管理员仍可登录后台解封。
+    """
+    path = request.url.path
+    is_api = path.startswith("/api/")
+    admin_api = path.startswith("/api/admin/")
+    ip = _client_ip(request)
+
+    if is_api and not admin_api:
+        try:
+            if admin_svc.is_blocked(ip):
+                return JSONResponse({"detail": "您的访问已被安全策略限制, 如有疑问请联系管理员"},
+                                    status_code=403)
+            if not admin_svc.check_rate(ip):
+                return JSONResponse({"detail": "请求过于频繁, 请稍后再试"}, status_code=429)
+        except Exception:
+            pass
+
+    response = await call_next(request)
+
+    if is_api and not admin_api:
+        try:
+            uid = _token_user_id(request.headers.get("authorization", ""))
+            admin_svc.record_visit(ip, request.method, path,
+                                   request.headers.get("user-agent", ""), uid,
+                                   response.status_code)
+        except Exception:                     # 访问记录失败不得影响正常响应
+            pass
+    return response
 
 
 # ========== 回放控制 ==========
@@ -911,10 +980,10 @@ def auth_logout(authorization: str = Header(default="")):
 def auth_me(user_id: str = Depends(get_current_user_id)):
     if user_id == "default":
         return {"user_id": "default", "username": "游客", "phone": "", "email": "",
-                "phone_bound": False, "logged_in": False}
+                "phone_bound": False, "role": "user", "logged_in": False}
     p = auth_svc.profile(user_id) or {"user_id": user_id, "username": user_id,
                                       "phone": "", "email": "", "phone_bound": False}
-    return {**p, "logged_in": True}
+    return {**p, "role": p.get("role") or "user", "logged_in": True}
 
 
 # ========== 自选股分组 ==========
@@ -1767,6 +1836,148 @@ def train_session_meta(session_id: str, req: SessionMetaRequest):
         ok = training_mgr.set_note(session_id, req.note) or ok
     if not ok: raise HTTPException(404, "训练记录不存在")
     return training_mgr.get_history(session_id)
+
+
+# ========== 系统后台 (需求101809) ==========
+# 全部接口需管理员权限 (require_admin); 自身不受访问收集/封禁/限流影响 (见中间件)
+
+class AdminUserStatusRequest(BaseModel):
+    status: str                                   # active / banned
+
+
+class AdminUserRoleRequest(BaseModel):
+    role: str                                     # user / admin
+
+
+class AdminResetPwdRequest(BaseModel):
+    new_password: str
+
+
+class AdminBlockIpRequest(BaseModel):
+    ip: str
+    reason: str = ""
+    hours: int = 0                                # 0 = 永久
+
+
+class AdminSecurityRequest(BaseModel):
+    settings: dict = Field(default_factory=dict)
+
+
+@app.get("/api/admin/overview")
+def admin_overview(_admin: str = Depends(require_admin)):
+    """后台总览: 账户统计 + 访问统计 + 封禁数"""
+    blocks = admin_svc.list_blocks().get("blocks", [])
+    return {
+        "users": auth_svc.user_stats(),
+        "visits": admin_svc.visit_stats(days=14),
+        "blocks": len(blocks),
+    }
+
+
+@app.get("/api/admin/users")
+def admin_users(keyword: str = "", limit: int = Query(50, ge=1, le=200),
+                offset: int = Query(0, ge=0), _admin: str = Depends(require_admin)):
+    return auth_svc.list_users(keyword=keyword, limit=limit, offset=offset)
+
+
+@app.get("/api/admin/users/stats")
+def admin_users_stats(_admin: str = Depends(require_admin)):
+    return auth_svc.user_stats()
+
+
+@app.post("/api/admin/users/{user_id}/status")
+def admin_user_status(user_id: str, req: AdminUserStatusRequest, _admin: str = Depends(require_admin)):
+    try:
+        ok = auth_svc.set_status(user_id, req.status)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not ok:
+        raise HTTPException(404, "用户不存在")
+    return {"success": True}
+
+
+@app.post("/api/admin/users/{user_id}/role")
+def admin_user_role(user_id: str, req: AdminUserRoleRequest, _admin: str = Depends(require_admin)):
+    try:
+        ok = auth_svc.set_role(user_id, req.role)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not ok:
+        raise HTTPException(404, "用户不存在")
+    return {"success": True}
+
+
+@app.post("/api/admin/users/{user_id}/reset-password")
+def admin_user_reset_pwd(user_id: str, req: AdminResetPwdRequest, _admin: str = Depends(require_admin)):
+    try:
+        ok = auth_svc.reset_password(user_id, req.new_password)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not ok:
+        raise HTTPException(404, "用户不存在")
+    return {"success": True}
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_user_delete(user_id: str, _admin: str = Depends(require_admin)):
+    try:
+        ok = auth_svc.delete_user(user_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not ok:
+        raise HTTPException(404, "用户不存在")
+    return {"success": True}
+
+
+@app.get("/api/admin/visits")
+def admin_visits(limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
+                 ip: str = "", _admin: str = Depends(require_admin)):
+    return admin_svc.list_visits(limit=limit, offset=offset, ip=ip)
+
+
+@app.get("/api/admin/visits/stats")
+def admin_visits_stats(days: int = Query(14, ge=1, le=60), _admin: str = Depends(require_admin)):
+    return admin_svc.visit_stats(days=days)
+
+
+@app.delete("/api/admin/visits")
+def admin_visits_clear(days: int = Query(0, ge=0), _admin: str = Depends(require_admin)):
+    return {"deleted": admin_svc.clear_visits(days=days)}
+
+
+@app.get("/api/admin/ips")
+def admin_ips(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
+              order: Literal["count", "recent"] = "count", _admin: str = Depends(require_admin)):
+    return admin_svc.list_ips(limit=limit, offset=offset, order=order)
+
+
+@app.get("/api/admin/blocks")
+def admin_blocks(_admin: str = Depends(require_admin)):
+    return admin_svc.list_blocks()
+
+
+@app.post("/api/admin/blocks")
+def admin_block(req: AdminBlockIpRequest, _admin: str = Depends(require_admin)):
+    try:
+        admin_svc.block_ip(req.ip, req.reason, req.hours)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"success": True}
+
+
+@app.delete("/api/admin/blocks/{ip}")
+def admin_unblock(ip: str, _admin: str = Depends(require_admin)):
+    return {"success": admin_svc.unblock_ip(ip)}
+
+
+@app.get("/api/admin/security")
+def admin_get_security(_admin: str = Depends(require_admin)):
+    return admin_svc.get_security()
+
+
+@app.post("/api/admin/security")
+def admin_set_security(req: AdminSecurityRequest, _admin: str = Depends(require_admin)):
+    return admin_svc.set_security(req.settings)
 
 
 # ========== 费率工具 ==========

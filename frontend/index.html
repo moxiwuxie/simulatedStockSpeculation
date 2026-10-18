@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>历史回放交易系统</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="style.css?v=78">
+<link rel="stylesheet" href="style.css?v=79">
 <!-- Vue 3 global build (包含 template compiler) -->
-<script src="vendor/vue.global.js?v=78"></script>
+<script src="vendor/vue.global.js?v=79"></script>
 <!-- ECharts -->
-<script src="vendor/echarts.min.js?v=78"></script>
+<script src="vendor/echarts.min.js?v=79"></script>
 </head>
 <body>
 
@@ -278,6 +278,12 @@
       <!-- 需求101803-0: 复盘模块页面右上角「?」说明 -->
       <span class="help-q pane-help" :data-tip="tabTip('review')">?</span>
       <review-pane :active="activeTab === 'review'"></review-pane>
+    </section>
+
+    <!-- ===== 系统后台 Tab (需求101809, 仅管理员可见) ===== -->
+    <section v-show="activeTab === 'admin'" class="pane no-pad">
+      <span class="help-q pane-help" :data-tip="tabTip('admin')">?</span>
+      <admin-pane :active="activeTab === 'admin'"></admin-pane>
     </section>
 
   </main>
@@ -608,12 +614,13 @@
   </div>
 </div>
 
-<script src="preload.js?v=78"></script>
-<script src="indicators.js?v=78"></script>
-<script src="live.js?v=78"></script>
-<script src="train.js?v=78"></script>
-<script src="review.js?v=78"></script>
-<script src="watch.js?v=78"></script>
-<script src="app.js?v=78"></script>
+<script src="preload.js?v=79"></script>
+<script src="indicators.js?v=79"></script>
+<script src="live.js?v=79"></script>
+<script src="train.js?v=79"></script>
+<script src="review.js?v=79"></script>
+<script src="watch.js?v=79"></script>
+<script src="admin.js?v=79"></script>
+<script src="app.js?v=79"></script>
 </body>
 </html>

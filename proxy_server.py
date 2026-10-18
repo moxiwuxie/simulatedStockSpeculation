@@ -119,7 +119,14 @@ class ProxyHandler(SimpleHTTPRequestHandler):
             k: v for k, v in self.headers.items()
             if k.lower() not in HOP_BY_HOP
             and k.lower() not in ("host", "content-length")
+            and k.lower() != "x-forwarded-for"
         }
+        # 需求101809: 透传真实客户端 IP, 否则后端只能看到 127.0.0.1 (本机反代对端),
+        # 导致访问IP收集/封禁/限流全部失效。已有上游 XFF 则追加, 否则以对端地址为源。
+        _peer = self.client_address[0] if self.client_address else "127.0.0.1"
+        _xff = self.headers.get("X-Forwarded-For", "")
+        headers["X-Forwarded-For"] = f"{_xff}, {_peer}" if _xff else _peer
+        headers["X-Real-IP"] = _peer
         if body is not None:
             headers["Content-Length"] = str(len(body))
 
