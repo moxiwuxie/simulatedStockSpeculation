@@ -1124,6 +1124,17 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
            cursor: pointer; user-select: none; }
 .wc-more:hover { text-decoration: underline; }
 
+/* 需求101810: 个股四榜提升权重 —— 分 tab 卡片(左, 前置) + 热点板块(右) */
+.rank-cols { grid-template-columns: 1.35fr 1fr; }
+.rank-card { border-color: var(--border-2); }
+.rank-card .watch-card-title { color: var(--brand); }
+.rank-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.rank-tab { font-size: 12px; padding: 3px 11px; border-radius: 999px; cursor: pointer;
+            color: var(--text-dim); background: var(--panel-2);
+            border: 1px solid var(--border); user-select: none; white-space: nowrap; }
+.rank-tab:hover { color: var(--text); }
+.rank-tab.active { color: #fff; background: var(--brand); border-color: var(--brand); }
+
 .watch-modal-mask { position: fixed; inset: 0; z-index: 1200; background: rgba(0,0,0,.55);
                     display: flex; align-items: center; justify-content: center; padding: 24px; }
 .watch-modal { width: min(720px, 100%); max-height: min(84vh, 900px); display: flex;
@@ -1152,6 +1163,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   .watch-indices { grid-template-columns: repeat(3, 1fr); }
   .watch-foreign { grid-template-columns: repeat(3, 1fr); }
   .watch-cols { grid-template-columns: 1fr; }
+  .rank-cols { grid-template-columns: 1fr; }
   /* 需求101807-0: 手机侧弹层近全屏 + 行高加大便于点击 */
   .watch-modal-mask { padding: 0; }
   .watch-modal { width: 100%; max-height: 100%; height: 100%; border-radius: 0; border: none; }

@@ -9,10 +9,12 @@
  * 需求101805: 指数分时缩略图 (0)、指数/板块点击跳行情 (1)、涨跌家数下方总成交额 (2)、
  * 个股四榜排序 (3)、板块按热点定位按涨幅展示 (4)。
  * 需求101807-0: 榜单「查看更多」—— 单卡片默认 12 行, 点击后经 /api/watch/list 取更长榜单弹层展示。
+ * 需求101810: 个股四榜 (涨幅/跌幅/快速涨幅/成交额) 提升权重, 合并为分 tab 卡片置于热点板块之前(左侧);
+ *             热点板块移至个股榜单 Tab 右侧展示。
  */
 (function () {
   'use strict';
-  const { ref, onMounted, watch } = Vue;
+  const { ref, computed, onMounted, watch } = Vue;
 
   async function api(path, opts) {
     // 需求101602: 统一走预加载/缓存层 (看盘全景为慢接口, 走缓存 + 预加载), 见 preload.js
@@ -37,6 +39,14 @@
     limit_up_today: '🚀 当日涨停股', limit_up_prev: '🕘 昨日涨停股',
     limit_down: '📉 跌停股', zhaban: '💥 炸板股',
   };
+
+  // 需求101810: 个股四榜分 tab 定义 (mid 决定行中列展示口径: turn=换手 / speed=涨速 / amount=成交额)
+  const RANK_TABS = [
+    { key: 'gain_stocks', label: '📈 涨幅榜', note: '按涨幅排序', mid: 'turn' },
+    { key: 'loss_stocks', label: '📉 跌幅榜', note: '按跌幅排序', mid: 'turn' },
+    { key: 'fast_stocks', label: '⚡ 快速涨幅', note: '按5日涨速排序', mid: 'speed' },
+    { key: 'amount_stocks', label: '💰 成交额榜', note: '按成交额排序', mid: 'amount' },
+  ];
 
   window.WatchPane = {
     name: 'watch-pane',
@@ -105,8 +115,30 @@
       <span class="wc-note">沪深北三市综合指数合计</span>
     </div>
 
-    <!-- 需求101805-4: 热点板块 (按涨幅降序) + 需求101805-3: 涨幅榜 -->
-    <div class="watch-cols">
+    <!-- 需求101810: 个股四榜提升权重 —— 分 tab 前置展示(左侧), 热点板块移至个股 Tab 右侧 -->
+    <div class="watch-cols rank-cols">
+      <div class="watch-card rank-card">
+        <div class="watch-card-title">
+          {{ rankTabMeta.label }} <span class="wc-note">{{ rankTabMeta.note }}</span>
+          <span class="wc-more" @click.stop="openMore(rankTab)">查看更多 ›</span>
+        </div>
+        <div class="rank-tabs">
+          <span v-for="t in RANK_TABS" :key="t.key" :class="['rank-tab', {active: rankTab === t.key}]"
+                @click="rankTab = t.key">{{ t.label }}</span>
+        </div>
+        <div v-for="s in rankRows" :key="rankTab + s.code" class="wr-row clickable"
+             :title="'点击查看 ' + s.name + ' K线/分时'" @click="openStock(s)">
+          <span class="wr-name">{{ s.name }}</span>
+          <span class="wr-code">{{ s.code }}</span>
+          <span class="wr-price">{{ s.price }}</span>
+          <span v-if="rankTabMeta.mid === 'speed'" class="wr-turn">涨速 {{ sign(s.speed) }}%</span>
+          <span v-else-if="rankTabMeta.mid === 'amount'" class="wr-turn">{{ fmtAmt(s.amount) }}</span>
+          <span v-else class="wr-turn">换手 {{ s.turnover }}%</span>
+          <span class="wr-pct" :class="pctClass(s.pct)">{{ sign(s.pct) }}%</span>
+        </div>
+        <div v-if="!rankRows.length" class="watch-empty">暂无数据</div>
+      </div>
+
       <div class="watch-card">
         <div class="watch-card-title">🔥 热点板块 <span class="wc-note">按涨幅排序 · 点击查看板块行情</span>
           <span class="wc-more" @click.stop="openMore('hot_boards')">查看更多 ›</span></div>
@@ -119,65 +151,10 @@
           <span class="wb-pct" :class="pctClass(b.pct)">{{ sign(b.pct) }}%</span>
         </div>
       </div>
-
-      <div class="watch-card">
-        <div class="watch-card-title up">📈 涨幅榜 <span class="wc-note">按涨幅排序</span>
-          <span class="wc-more" @click.stop="openMore('gain_stocks')">查看更多 ›</span></div>
-        <div v-for="s in data.gain_stocks" :key="'g' + s.code" class="wr-row clickable"
-             title="点击查看该股K线/分时" @click="openStock(s)">
-          <span class="wr-name">{{ s.name }}</span>
-          <span class="wr-code">{{ s.code }}</span>
-          <span class="wr-price">{{ s.price }}</span>
-          <span class="wr-turn">换手 {{ s.turnover }}%</span>
-          <span class="wr-pct" :class="pctClass(s.pct)">{{ sign(s.pct) }}%</span>
-        </div>
-      </div>
     </div>
 
-    <!-- 需求101805-3: 跌幅榜 (最跌在前) + 快速涨幅 -->
+    <!-- 需求101805-3: 当日涨停股 + 昨日涨停股 -->
     <div class="watch-cols">
-      <div class="watch-card">
-        <div class="watch-card-title down">📉 跌幅榜 <span class="wc-note">按跌幅排序</span>
-          <span class="wc-more" @click.stop="openMore('loss_stocks')">查看更多 ›</span></div>
-        <div v-for="s in data.loss_stocks" :key="'l' + s.code" class="wr-row clickable"
-             title="点击查看该股K线/分时" @click="openStock(s)">
-          <span class="wr-name">{{ s.name }}</span>
-          <span class="wr-code">{{ s.code }}</span>
-          <span class="wr-price">{{ s.price }}</span>
-          <span class="wr-turn">换手 {{ s.turnover }}%</span>
-          <span class="wr-pct" :class="pctClass(s.pct)">{{ sign(s.pct) }}%</span>
-        </div>
-      </div>
-
-      <div class="watch-card">
-        <div class="watch-card-title up">⚡ 快速涨幅 <span class="wc-note">按5日涨速排序</span>
-          <span class="wc-more" @click.stop="openMore('fast_stocks')">查看更多 ›</span></div>
-        <div v-for="s in data.fast_stocks" :key="'f' + s.code" class="wr-row clickable"
-             title="点击查看该股K线/分时" @click="openStock(s)">
-          <span class="wr-name">{{ s.name }}</span>
-          <span class="wr-code">{{ s.code }}</span>
-          <span class="wr-price">{{ s.price }}</span>
-          <span class="wr-turn">涨速 {{ sign(s.speed) }}%</span>
-          <span class="wr-pct" :class="pctClass(s.pct)">{{ sign(s.pct) }}%</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- 需求101805-3: 成交额榜 + 当日涨停股 -->
-    <div class="watch-cols">
-      <div class="watch-card">
-        <div class="watch-card-title">💰 成交额榜 <span class="wc-note">按成交额排序</span>
-          <span class="wc-more" @click.stop="openMore('amount_stocks')">查看更多 ›</span></div>
-        <div v-for="s in data.amount_stocks" :key="'a' + s.code" class="wr-row clickable"
-             title="点击查看该股K线/分时" @click="openStock(s)">
-          <span class="wr-name">{{ s.name }}</span>
-          <span class="wr-code">{{ s.code }}</span>
-          <span class="wr-price">{{ s.price }}</span>
-          <span class="wr-turn">{{ fmtAmt(s.amount) }}</span>
-          <span class="wr-pct" :class="pctClass(s.pct)">{{ sign(s.pct) }}%</span>
-        </div>
-      </div>
-
       <div class="watch-card">
         <div class="watch-card-title up">🚀 当日涨停股 <span class="wc-note">点击查看K线</span>
           <span class="wc-more" @click.stop="openMore('limit_up_today')">查看更多 ›</span></div>
@@ -190,10 +167,7 @@
           <span class="wr-pct up">{{ sign(s.pct) }}%</span>
         </div>
       </div>
-    </div>
 
-    <div class="watch-cols">
-      <!-- 昨日涨停股 -->
       <div class="watch-card">
         <div class="watch-card-title">🕘 昨日涨停股 <span class="wc-note">点击查看K线</span>
           <span class="wc-more" @click.stop="openMore('limit_up_prev')">查看更多 ›</span></div>
@@ -206,8 +180,10 @@
           <span class="wr-pct" :class="pctClass(s.pct)">{{ sign(s.pct) }}%</span>
         </div>
       </div>
+    </div>
 
-      <!-- 跌停股 -->
+    <!-- 需求101805-3: 跌停股 + 炸板股 -->
+    <div class="watch-cols">
       <div class="watch-card">
         <div class="watch-card-title down">📉 跌停股 <span class="wc-note">点击查看K线</span>
           <span class="wc-more" @click.stop="openMore('limit_down')">查看更多 ›</span></div>
@@ -220,10 +196,7 @@
           <span class="wr-pct down">{{ sign(s.pct) }}%</span>
         </div>
       </div>
-    </div>
 
-    <div class="watch-cols">
-      <!-- 炸板股 -->
       <div class="watch-card">
         <div class="watch-card-title warn">💥 炸板股 <span class="wc-note">点击查看K线</span>
           <span class="wc-more" @click.stop="openMore('zhaban')">查看更多 ›</span></div>
@@ -281,6 +254,14 @@
       const idxSpark = ref({});        // 需求101805-0: 指数代码 -> [当日价格序列]
       // 需求101807-0: 榜单「查看更多」弹层状态 (null = 关闭)
       const more = ref(null);
+      // 需求101810: 个股四榜分 tab (当前选中榜单 + 对应行数据/标题口径)
+      const rankTab = ref('gain_stocks');
+      const rankRows = computed(function () {
+        return (data.value && data.value[rankTab.value]) || [];
+      });
+      const rankTabMeta = computed(function () {
+        return RANK_TABS.find(function (t) { return t.key === rankTab.value; }) || RANK_TABS[0];
+      });
 
       async function load() {
         if (loading.value) return;
@@ -363,7 +344,8 @@
       return { data, loading, error, load, pctClass, sign, nb, fmtAmt,
                idxSparkPath, idxSparkCls,
                openIndex, openBoard, openStock, openStockByCode,
-               more, openMore, closeMore, morePick };
+               more, openMore, closeMore, morePick,
+               RANK_TABS, rankTab, rankRows, rankTabMeta };
     },
   };
 })();
