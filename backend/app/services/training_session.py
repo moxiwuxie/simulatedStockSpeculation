@@ -93,22 +93,26 @@ CATEGORY_POOLS = {}
 CATEGORY_LEVERAGE = {}
 
 # 品类展示名
+# 需求101808-1: 「股票双盲」与「长周期训练」合并为单一品类 (stock), 单局根数上限放宽到 1250;
+#                原「长周期训练」品类下线, 存量记录在 _init_db 中迁移到 stock。
 CATEGORY_LABELS = {
-    "stock": "股票双盲", "long": "长周期训练", "demon": "妖股训练",
+    "stock": "股票双盲", "demon": "妖股训练",
 }
 
-# 训练品类 → 数据源 (A 股日 K: 股票双盲 + 长周期 + 妖股 共用)
+# 非双盲训练展示名 (需求101808-2: 指定标的 + 起始日期时, 品类名称改为此)
+NON_BLIND_LABEL = "非双盲训练"
+
+# 训练品类 → 数据源 (A 股日 K: 股票双盲(含长周期) + 妖股 共用)
 CATEGORY_FETCHERS = {
-    "stock": _fetch_stock_kline,
-    "long": _fetch_stock_kline,           # 单标的长周期 (双盲), 仅放宽单局根数上限
+    "stock": _fetch_stock_kline,          # 股票双盲 / 长周期 / 非双盲 共用, 仅由 bars 决定窗口长度
     "demon": _fetch_stock_kline,          # 需求101802-0: 妖股训练, 标的从妖股池抽取
 }
 
-# 单局 K 线根数上限 (长周期训练放宽到 1250 根, 其余沿用 250)
-CATEGORY_BARS_CAP = {"stock": 250, "long": 1250, "demon": 250}
+# 单局 K 线根数上限 (需求101808-1: 股票双盲合并长周期 → 上限放宽到 1250 根)
+CATEGORY_BARS_CAP = {"stock": 1250, "demon": 250}
 
 # 品类默认单局根数 (前端滑块初始值)
-CATEGORY_DEFAULT_BARS = {"stock": 250, "long": 1250, "demon": 250}
+CATEGORY_DEFAULT_BARS = {"stock": 250, "demon": 250}
 
 # 单局最少根数 (与前端滑块下限同口径)
 MIN_BARS = 20
@@ -1119,6 +1123,15 @@ class TrainingSession:
             prev_close = None
         return self._intraday(self.code, b, prev_close, f"#{len(self.pre_bars) + idx + 1}")
 
+    def _category_label(self) -> str:
+        """需求101808-2: 指定标的 + 起始日期 (非双盲) 时, 品类名称显示为「非双盲训练」
+
+        随机抽取(双盲)仍显示品类基础名称; 非双盲仅发生在用户同时给出 code 与 start_date 时。
+        """
+        if self.non_blind:
+            return NON_BLIND_LABEL
+        return CATEGORY_LABELS.get(self.category, self.category)
+
     def summary(self, hide_meta: bool = True) -> dict:
         """会话状态快照, hide_meta=True 时隐藏 code/date (双盲)"""
         price = self.current_price or (self.bars[-1]["close"] if self.bars else 0)
@@ -1130,7 +1143,7 @@ class TrainingSession:
             "status_label": STATUS_LABELS.get(self.status, self.status),
             "terminal": self.status in TERMINAL_STATUSES,
             "category": self.category,
-            "category_label": CATEGORY_LABELS.get(self.category, self.category),
+            "category_label": self._category_label(),
             "period": self.period,
             "leverage": self.leverage,
             "strategy_id": self.strategy_id,
@@ -1280,9 +1293,14 @@ class TrainingManager:
                 ("code_name", "ADD COLUMN code_name TEXT DEFAULT ''"),
                 ("limit_up_count", "ADD COLUMN limit_up_count INTEGER DEFAULT 0"),
                 ("limit_up_bucket", "ADD COLUMN limit_up_bucket TEXT DEFAULT ''"),
+                # 需求101808-2: 非双盲(指定标的+起始日期)记录标记, 供历史/复盘同步显示品类名
+                ("non_blind", "ADD COLUMN non_blind INTEGER DEFAULT 0"),
             ):
                 if col not in cols:
                     c.execute(f"ALTER TABLE training_sessions {ddl}")
+            # 需求101808-1/2: 「长周期训练」品类已合并进「股票双盲」(stock), 存量记录一并迁移 (幂等)
+            c.execute("UPDATE training_sessions SET category='stock', category_label=? "
+                      "WHERE category='long'", (CATEGORY_LABELS.get("stock", "股票双盲"),))
             # 迁移: 旧「默认」战法改名为「副本」
             # 注意: 不再自动创建/绑定「副本」——训练未指定战法时 strategy_id 保持 NULL,
             # 界面按「默认(未归类)」展示, 避免战法库凭空冒出一个用户没建过的战法。
@@ -1705,9 +1723,9 @@ class TrainingManager:
                 (session_id, status, category, code, code_revealed, start_date, end_date,
                  bars_total, bars_used, initial_capital, final_capital, pnl, pnl_pct,
                  trades_count, round_trips, win_count, win_rate, created_at, settled_at, settlement_json,
-                 strategy_id, leverage, max_drawdown, blown_up, category_label, user_id, code_name,
-                 limit_up_count, limit_up_bucket)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 strategy_id, leverage, max_drawdown, blown_up, category_label, non_blind,
+                 user_id, code_name, limit_up_count, limit_up_bucket)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (s.session_id, s.status, s.category, s.code, s.code_revealed,
                  s.start_date, s.end_date, s.bars_total, s.bars_used,
                  s.initial_capital, round(s.portfolio_value, 2), round(s.pnl, 2), round(s.pnl_pct, 2),
@@ -1716,7 +1734,8 @@ class TrainingManager:
                  datetime.now().strftime("%Y-%m-%d %H:%M:%S"), None, None,
                  s.strategy_id, s.leverage,
                  s.max_drawdown, 1 if s.blown_up else 0,
-                 CATEGORY_LABELS.get(s.category, s.category),
+                 s._category_label(),             # 需求101808-2: 非双盲记录品类名为「非双盲训练」
+                 1 if s.non_blind else 0,
                  s.user_id, s.code_name,
                  s.limit_up_count, s.limit_up_bucket))
             if own:
@@ -1789,7 +1808,7 @@ class TrainingManager:
                 WHERE session_id=?""",
                 (s.status, round(s.portfolio_value, 2), round(s.pnl, 2), final_pnl_pct, final_win_rate,
                  s.max_drawdown, 1 if s.blown_up else 0, s.leverage, s.strategy_id,
-                 CATEGORY_LABELS.get(s.category, s.category),
+                 s._category_label(),             # 需求101808-2: 结算时同步品类名(非双盲)
                  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                  json.dumps(s.summary(hide_meta=False), ensure_ascii=False), s.session_id))
             if own:
@@ -1844,7 +1863,7 @@ class TrainingManager:
         with sqlite3.connect(str(self._db_path)) as conn:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
-            c.execute(f"""SELECT s.session_id, s.status, s.category, s.category_label,
+            c.execute(f"""SELECT s.session_id, s.status, s.category, s.category_label, s.non_blind,
                     s.code, s.code_name, s.code_revealed, s.start_date, s.end_date,
                     s.bars_total, s.bars_used, s.initial_capital, s.final_capital,
                     s.pnl, s.pnl_pct, s.trades_count, s.round_trips, s.win_count, s.win_rate,
@@ -1858,6 +1877,12 @@ class TrainingManager:
             rows = [dict(r) for r in c.fetchall()]
         for r in rows:
             r["status_label"] = STATUS_LABELS.get(r.get("status"), r.get("status"))
+            # 需求101808-2: 历史记录同步 —— 非双盲局显示「非双盲训练」, 否则回落到品类基础名
+            if r.get("non_blind"):
+                r["category_label"] = NON_BLIND_LABEL
+            else:
+                r["category_label"] = (r.get("category_label")
+                                       or CATEGORY_LABELS.get(r.get("category"), r.get("category")))
         return rows
 
     # ---------- 收益曲线 (累计净值) / 重置 ----------

@@ -61,7 +61,7 @@ def _warm_training_pool(max_codes: int = POOL_WARM_MAX, min_pool: int = POOL_MIN
 
     # ① 池内候选 (与 start 的排序口径一致: 统计日 / 最新收盘 降序)
     codes: List[str] = []
-    for cat in ("stock", "long"):                       # 双盲 250 / 长周期 1250
+    for cat in ("stock", "demon"):                       # 股票双盲 1250 / 妖股 250
         try:
             rows = pool.candidates(CATEGORY_BARS_CAP.get(cat, 250) + 30, only_intraday=True)
         except Exception:

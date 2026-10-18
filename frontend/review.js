@@ -352,7 +352,7 @@
         </select>
         <select v-model="attrCategory" class="mini-select">
           <option value="stock">股票双盲</option>
-          <option value="long">长周期训练</option>
+          <option value="demon">妖股训练</option>
         </select>
         <button class="btn mini" :disabled="attrLoading" @click="loadAttribution">
           {{ attrLoading ? '分析中...' : '生成归因' }}

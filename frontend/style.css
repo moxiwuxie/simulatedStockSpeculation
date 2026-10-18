@@ -1549,7 +1549,8 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   color: var(--brand); background: var(--brand-soft); border: 1px solid var(--border);
 }
 /* 需求101508-2: 涨幅列的当日分时缩略图 */
-.wl-table td.spark { min-width: 96px; }
+/* 需求101808-0: 缩略图宽 60px, 原 min-width 96px 会在左侧留空白, 收紧到贴合内容 */
+.wl-table td.spark { min-width: 64px; }
 .wl-spark { display: block; width: 60px; height: 20px; margin-left: auto; }
 .wl-spark polyline { fill: none; stroke-width: 1.4;
                      stroke-linecap: round; stroke-linejoin: round; }
@@ -1687,6 +1688,8 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 .pool-chip:hover { color: var(--text-strong); border-color: var(--border-hover); }
 .pool-chip.active { color: var(--brand); background: var(--brand-soft); border-color: var(--brand); }
 .pool-count { margin-left: auto; font-size: 12px; color: var(--text-dim); }
+/* 需求101808-3: 标的池品类/筛选行的小标题 */
+.pool-sub { font-size: 12px; color: var(--text-dim); margin-right: 2px; }
 .pool-body { flex: 1; overflow: auto; padding: 4px 10px 10px; }
 .pool-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .pool-table th {

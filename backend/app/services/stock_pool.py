@@ -633,15 +633,21 @@ def _public_row(r: dict) -> dict:
 
 
 def pool_query(flt: str = "all", limit: int = 50, offset: int = 0,
-               refresh_days: int = FRESH_DAYS) -> dict:
+               refresh_days: int = FRESH_DAYS, category: str = "all") -> dict:
     """训练标的池查询 (需求101802-1): 返回当前池内个股 + 筛选维度与总数
 
     仅返回「未过期」行 (stat_date >= 今日 - refresh_days), 与训练候选口径一致;
     排序: 妖股优先 → 妖股分值降序 → 涨停次数降序 → 统计日降序。
+
+    需求101808-3: ``category`` 为训练品类 (stock/demon), 使标的池按品类分别展示;
+    ``demon`` 仅看妖股池, ``stock``/``all`` 不额外过滤。
     """
     f = (flt or "all").strip().lower()
     if f not in POOL_FILTER_KEYS:
         f = "all"
+    cat = (category or "all").strip().lower()
+    if cat not in ("stock", "demon"):
+        cat = "all"
     try:
         limit = max(1, min(int(limit or 50), 200))
     except (TypeError, ValueError):
@@ -651,7 +657,7 @@ def pool_query(flt: str = "all", limit: int = 50, offset: int = 0,
     except (TypeError, ValueError):
         offset = 0
     filters = [{"key": k, "label": v} for k, v in POOL_FILTERS]
-    empty = {"total": 0, "filter": f, "filters": filters, "rows": []}
+    empty = {"total": 0, "filter": f, "category": cat, "filters": filters, "rows": []}
     try:
         _ensure_table()
         cutoff = date.fromordinal(
@@ -661,6 +667,8 @@ def pool_query(flt: str = "all", limit: int = 50, offset: int = 0,
             "limit_up": " AND limit_up_count > 0",
             "vol_anomaly": " AND vol_anomaly = 1",
         }.get(f, "")
+        if cat == "demon":
+            extra += " AND is_demon = 1"
         where = "stat_date >= ?" + extra
         order = ("ORDER BY is_demon DESC, demon_score DESC, limit_up_count DESC, "
                  "stat_date DESC, code ASC")
@@ -670,7 +678,7 @@ def pool_query(flt: str = "all", limit: int = 50, offset: int = 0,
             rows = c.execute(
                 f"SELECT * FROM stock_pool WHERE {where} {order} LIMIT ? OFFSET ?",
                 (cutoff, limit, offset)).fetchall()
-        return {"total": int(total), "filter": f, "filters": filters,
+        return {"total": int(total), "filter": f, "category": cat, "filters": filters,
                 "rows": [_public_row(dict(r)) for r in rows]}
     except Exception as e:
         print(f"[StockPool] 查询池失败: {e}")

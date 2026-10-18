@@ -398,6 +398,13 @@
         <button class="pool-close" @click="closePool" title="关闭">✕</button>
       </div>
       <div class="pool-filters">
+        <span class="pool-sub">品类</span>
+        <span v-for="c in categories" :key="c.key"
+              :class="['pool-chip', { active: poolCategory === c.key }]"
+              @click="pickPoolCategory(c.key)">{{ c.label }}</span>
+      </div>
+      <div class="pool-filters">
+        <span class="pool-sub">筛选</span>
         <span v-for="f in poolFilters" :key="f.key"
               :class="['pool-chip', { active: poolFilter === f.key }]"
               @click="pickPoolFilter(f.key)">{{ f.label }}</span>
@@ -736,7 +743,7 @@
         return !!(s && s.status === 'active' && s.pos > 0 && (s.sellable_qty || 0) <= 0);
       });
 
-      // 单局 K 线根数上限: 由后端品类元数据驱动 (股票双盲 250 / 长周期训练 1250)
+      // 单局 K 线根数上限: 由后端品类元数据驱动 (股票双盲 1250(含长周期) / 妖股训练 250)
       const curCat = computed(function () {
         return categories.value.find(function (c) { return c.key === form.category; }) || null;
       });
@@ -992,6 +999,8 @@
       const poolTotal = ref(0);
       const poolFilters = ref([]);
       const poolFilter = ref('all');
+      // 需求101808-3: 标的池按品类分别展示 (stock/demon)
+      const poolCategory = ref('stock');
       const poolLoading = ref(false);
       const poolOffset = ref(0);
       const POOL_PAGE = 30;
@@ -1007,6 +1016,7 @@
         try {
           if (reset) { poolOffset.value = 0; window.__apiCacheClear('/training/pool'); }
           const q = '/training/pool?filter=' + encodeURIComponent(poolFilter.value) +
+                    '&category=' + encodeURIComponent(poolCategory.value) +
                     '&limit=' + POOL_PAGE + '&offset=' + poolOffset.value;
           const res = await api(q, { method: 'GET' }, { httpNoStore: true });
           poolTotal.value = res.total || 0;
@@ -1018,11 +1028,24 @@
           if (reset) { poolRows.value = []; poolTotal.value = 0; }
         } finally { poolLoading.value = false; }
       }
-      function openPool() { poolOpen.value = true; loadPool(true); }
+      function openPool() {
+        poolOpen.value = true;
+        // 需求101808-3: 默认对齐当前训练品类, 再按品类分别展示
+        if (categories.value.some(function (c) { return c.key === form.category; })) {
+          poolCategory.value = form.category;
+        }
+        loadPool(true);
+      }
       function closePool() { poolOpen.value = false; }
       function pickPoolFilter(k) {
         if (poolFilter.value === k) return;
         poolFilter.value = k;
+        loadPool(true);
+      }
+      /** 需求101808-3: 切换标的池品类 (stock/demon), 重新拉取该品类池 */
+      function pickPoolCategory(k) {
+        if (poolCategory.value === k) return;
+        poolCategory.value = k;
         loadPool(true);
       }
       function poolMore() { loadPool(false); }
@@ -1727,6 +1750,8 @@
         // 需求101802-1: 训练标的池
         poolOpen, poolRows, poolTotal, poolFilters, poolFilter, poolLoading,
         poolHasMore, poolPct, openPool, closePool, pickPoolFilter, poolMore, usePoolRow,
+        // 需求101808-3: 标的池品类维度
+        poolCategory, pickPoolCategory,
       };
     },
   };

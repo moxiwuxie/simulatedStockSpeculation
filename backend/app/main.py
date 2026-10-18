@@ -1279,7 +1279,8 @@ def dyn_groups_preview(req: DynPreviewRequest, user_id: str = Depends(require_us
 # ========== 训练系统 ==========
 
 class TrainStartRequest(BaseModel):
-    category: Literal["stock", "long", "demon"] = "stock"
+    # 需求101808-1: 「股票双盲」合并原「长周期训练」(单局上限 1250 根), long 品类已下线
+    category: Literal["stock", "demon"] = "stock"
     bars: int = Field(100, ge=20, le=1250)
     code: Optional[str] = None
     initial_capital: float = Field(100_000.0, ge=10_000)
@@ -1328,10 +1329,11 @@ class TrainPeriodRequest(BaseModel):
 
 @app.get("/api/training/categories")
 def train_categories(response: Response):
-    """训练品类元数据 (股票双盲 + 长周期训练)
+    """训练品类元数据 (股票双盲(含长周期) + 妖股训练)
 
-    需求101701-2: 移动端曾因浏览器缓存旧响应而看不到「长周期训练」品类。
+    需求101701-2: 移动端曾因浏览器缓存旧响应而看不到最新品类。
     该接口不使用任何缓存 (no-store), 保证每次进入训练模块都拿到最新品类列表。
+    需求101808-1: 「长周期训练」并入「股票双盲」(单局上限 1250 根), 品类仅 stock/demon。
     """
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     response.headers["Pragma"] = "no-cache"
@@ -1351,14 +1353,15 @@ def train_categories(response: Response):
 
 @app.get("/api/training/pool")
 def train_pool(filter: str = Query("all"), limit: int = Query(50, ge=1, le=200),
-               offset: int = Query(0, ge=0)):
+               offset: int = Query(0, ge=0), category: str = Query("all")):
     """训练标的池 (需求101802-1): 展示当前池内个股 + 筛选维度
 
     filter: all / demon(妖股) / limit_up(有涨停) / vol_anomaly(量能异常)
+    category: 需求101808-3 训练品类 (stock/demon), 使标的池按品类分别展示
     仅返回未过期行 (与训练候选口径一致), 供前端弹窗列表展示与选为训练标的。
     """
     from .services.stock_pool import pool_query
-    return pool_query(filter, limit, offset)
+    return pool_query(filter, limit, offset, category=category)
 
 
 @app.post("/api/training/start")
