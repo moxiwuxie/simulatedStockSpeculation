@@ -1713,6 +1713,21 @@ def watch_index_sparklines(codes: str = Query("", max_length=400)):
     return {"items": out}
 
 
+@app.get("/api/watch/list")
+def watch_list(key: str = Query("", max_length=40), limit: int = Query(30, ge=1, le=60)):
+    """需求101807-0: 盘面榜单卡片「查看更多」—— 返回更长的板块/个股榜单
+
+    ``key`` 为盘面 section 键 (hot_boards / gain_stocks / ... / zhaban);
+    实时取数失败时回落全景缓存中的同名短榜 (附 error 说明), 保证弹层不空白。
+    """
+    from .services.watch import section_list
+    try:
+        return section_list(key, limit)
+    except Exception as e:                # noqa: BLE001 - 兜底: 不 5xx
+        return {"key": key, "limit": limit, "kind": "", "items": [], "mode": "",
+                "error": str(e)}
+
+
 @app.get("/api/preload")
 def trigger_preload(force: bool = False):
     """需求101602: 触发后端预加载 —— 后台预热各重接口缓存, 立即返回进度

@@ -443,7 +443,8 @@
       </tr></thead>
       <tbody>
         <tr v-for="p in acct.positions" :key="p.code"
-            @click="fillPosition(p)" title="点击填充至下单面板">
+            @click="fillPosition(p)" @dblclick="gotoPositionChart(p)"
+            title="单击填充至下单面板 · 双击查看该股行情">
           <td>{{ p.code }}</td>
           <td>{{ p.name }}</td>
           <td>{{ p.quantity }}</td>
@@ -527,6 +528,12 @@
         msg.value = '已填充 ' + (p.name || '') + ' ' + p.code + ' 至下单面板';
       }
 
+      // 需求101807-2: 双击持仓个股 → 跳转行情页展示该股 K线/分时 (不加入自选/分类)
+      function gotoPositionChart(p) {
+        if (!p || !p.code) return;
+        gotoStock({ code: p.code, name: p.name, price: p.price, change_pct: p.profit_pct });
+      }
+
       function statusLabel(s) {
         return { PENDING: '挂单中', FILLED: '已成交', CANCELED: '已撤单', REJECTED: '已拒绝' }[s] || s;
       }
@@ -579,7 +586,7 @@
       }, { immediate: true });
       onUnmounted(() => { if (timer) clearInterval(timer); });
 
-      return { tiers, acct, orders, trades, msg, orderBox, fillPosition,
+      return { tiers, acct, orders, trades, msg, orderBox, fillPosition, gotoPositionChart,
                loadAll, bindTier, resetAccount, cancelOrder, statusLabel, money, signClass };
     },
   };

@@ -8,6 +8,7 @@
  *
  * 需求101805: 指数分时缩略图 (0)、指数/板块点击跳行情 (1)、涨跌家数下方总成交额 (2)、
  * 个股四榜排序 (3)、板块按热点定位按涨幅展示 (4)。
+ * 需求101807-0: 榜单「查看更多」—— 单卡片默认 12 行, 点击后经 /api/watch/list 取更长榜单弹层展示。
  */
 (function () {
   'use strict';
@@ -28,6 +29,14 @@
     if (a >= 1e4) return (n / 1e4).toFixed(2) + '万';
     return Number(n).toFixed(2);
   }
+
+  // 需求101807-0: 「查看更多」弹层标题
+  const MORE_TITLES = {
+    hot_boards: '🔥 热点板块', gain_stocks: '📈 涨幅榜', loss_stocks: '📉 跌幅榜',
+    fast_stocks: '⚡ 快速涨幅', amount_stocks: '💰 成交额榜',
+    limit_up_today: '🚀 当日涨停股', limit_up_prev: '🕘 昨日涨停股',
+    limit_down: '📉 跌停股', zhaban: '💥 炸板股',
+  };
 
   window.WatchPane = {
     name: 'watch-pane',
@@ -99,7 +108,8 @@
     <!-- 需求101805-4: 热点板块 (按涨幅降序) + 需求101805-3: 涨幅榜 -->
     <div class="watch-cols">
       <div class="watch-card">
-        <div class="watch-card-title">🔥 热点板块 <span class="wc-note">按涨幅排序 · 点击查看板块行情</span></div>
+        <div class="watch-card-title">🔥 热点板块 <span class="wc-note">按涨幅排序 · 点击查看板块行情</span>
+          <span class="wc-more" @click.stop="openMore('hot_boards')">查看更多 ›</span></div>
         <div v-for="b in data.hot_boards" :key="b.name" class="wb-row clickable"
              title="点击查看该板块K线/分时" @click="openBoard(b)">
           <span class="wb-name">{{ b.name }}</span>
@@ -111,7 +121,8 @@
       </div>
 
       <div class="watch-card">
-        <div class="watch-card-title up">📈 涨幅榜 <span class="wc-note">按涨幅排序</span></div>
+        <div class="watch-card-title up">📈 涨幅榜 <span class="wc-note">按涨幅排序</span>
+          <span class="wc-more" @click.stop="openMore('gain_stocks')">查看更多 ›</span></div>
         <div v-for="s in data.gain_stocks" :key="'g' + s.code" class="wr-row clickable"
              title="点击查看该股K线/分时" @click="openStock(s)">
           <span class="wr-name">{{ s.name }}</span>
@@ -126,7 +137,8 @@
     <!-- 需求101805-3: 跌幅榜 (最跌在前) + 快速涨幅 -->
     <div class="watch-cols">
       <div class="watch-card">
-        <div class="watch-card-title down">📉 跌幅榜 <span class="wc-note">按跌幅排序</span></div>
+        <div class="watch-card-title down">📉 跌幅榜 <span class="wc-note">按跌幅排序</span>
+          <span class="wc-more" @click.stop="openMore('loss_stocks')">查看更多 ›</span></div>
         <div v-for="s in data.loss_stocks" :key="'l' + s.code" class="wr-row clickable"
              title="点击查看该股K线/分时" @click="openStock(s)">
           <span class="wr-name">{{ s.name }}</span>
@@ -138,7 +150,8 @@
       </div>
 
       <div class="watch-card">
-        <div class="watch-card-title up">⚡ 快速涨幅 <span class="wc-note">按5日涨速排序</span></div>
+        <div class="watch-card-title up">⚡ 快速涨幅 <span class="wc-note">按5日涨速排序</span>
+          <span class="wc-more" @click.stop="openMore('fast_stocks')">查看更多 ›</span></div>
         <div v-for="s in data.fast_stocks" :key="'f' + s.code" class="wr-row clickable"
              title="点击查看该股K线/分时" @click="openStock(s)">
           <span class="wr-name">{{ s.name }}</span>
@@ -153,7 +166,8 @@
     <!-- 需求101805-3: 成交额榜 + 当日涨停股 -->
     <div class="watch-cols">
       <div class="watch-card">
-        <div class="watch-card-title">💰 成交额榜 <span class="wc-note">按成交额排序</span></div>
+        <div class="watch-card-title">💰 成交额榜 <span class="wc-note">按成交额排序</span>
+          <span class="wc-more" @click.stop="openMore('amount_stocks')">查看更多 ›</span></div>
         <div v-for="s in data.amount_stocks" :key="'a' + s.code" class="wr-row clickable"
              title="点击查看该股K线/分时" @click="openStock(s)">
           <span class="wr-name">{{ s.name }}</span>
@@ -165,7 +179,8 @@
       </div>
 
       <div class="watch-card">
-        <div class="watch-card-title up">🚀 当日涨停股 <span class="wc-note">点击查看K线</span></div>
+        <div class="watch-card-title up">🚀 当日涨停股 <span class="wc-note">点击查看K线</span>
+          <span class="wc-more" @click.stop="openMore('limit_up_today')">查看更多 ›</span></div>
         <div v-for="s in data.limit_up_today" :key="'lu' + s.code" class="wr-row clickable"
              title="点击查看该股K线/分时" @click="openStock(s)">
           <span class="wr-name">{{ s.name }}</span>
@@ -180,7 +195,8 @@
     <div class="watch-cols">
       <!-- 昨日涨停股 -->
       <div class="watch-card">
-        <div class="watch-card-title">🕘 昨日涨停股 <span class="wc-note">点击查看K线</span></div>
+        <div class="watch-card-title">🕘 昨日涨停股 <span class="wc-note">点击查看K线</span>
+          <span class="wc-more" @click.stop="openMore('limit_up_prev')">查看更多 ›</span></div>
         <div v-for="s in data.limit_up_prev" :key="'lp' + s.code" class="wr-row clickable"
              title="点击查看该股K线/分时" @click="openStock(s)">
           <span class="wr-name">{{ s.name }}</span>
@@ -193,7 +209,8 @@
 
       <!-- 跌停股 -->
       <div class="watch-card">
-        <div class="watch-card-title down">📉 跌停股 <span class="wc-note">点击查看K线</span></div>
+        <div class="watch-card-title down">📉 跌停股 <span class="wc-note">点击查看K线</span>
+          <span class="wc-more" @click.stop="openMore('limit_down')">查看更多 ›</span></div>
         <div v-for="s in data.limit_down" :key="'ld' + s.code" class="wr-row clickable"
              title="点击查看该股K线/分时" @click="openStock(s)">
           <span class="wr-name">{{ s.name }}</span>
@@ -208,7 +225,8 @@
     <div class="watch-cols">
       <!-- 炸板股 -->
       <div class="watch-card">
-        <div class="watch-card-title warn">💥 炸板股 <span class="wc-note">点击查看K线</span></div>
+        <div class="watch-card-title warn">💥 炸板股 <span class="wc-note">点击查看K线</span>
+          <span class="wc-more" @click.stop="openMore('zhaban')">查看更多 ›</span></div>
         <div v-for="s in data.zhaban" :key="'zb' + s.code" class="wr-row clickable"
              title="点击查看该股K线/分时" @click="openStock(s)">
           <span class="wr-name">{{ s.name }}</span>
@@ -222,6 +240,38 @@
   </template>
 
   <div v-else-if="loading" class="watch-empty">⏳ 正在加载盘面数据...</div>
+
+  <!-- 需求101807-0: 榜单「查看更多」弹层 -->
+  <div v-if="more" class="watch-modal-mask" @click.self="closeMore">
+    <div class="watch-modal">
+      <div class="wm-head">
+        <span class="wm-title">{{ more.title }}</span>
+        <span class="wc-note" v-if="more.kind === 'board'">按涨幅排序 · 点击查看板块行情</span>
+        <span class="wc-note" v-else>{{ more.rows.length }} 只 · 点击查看K线</span>
+        <button class="btn mini ghost" @click="closeMore">关闭 ✕</button>
+      </div>
+      <div class="wm-body">
+        <div v-if="more.loading" class="watch-empty">⏳ 加载中...</div>
+        <template v-else>
+          <div v-if="more.mode === 'reserve'" class="wm-warn">实时取数失败, 展示最近一次快照 ({{ more.error }})</div>
+          <div v-for="(b, i) in more.rows" :key="'m' + (b.code || b.name) + i"
+               class="wm-row clickable" @click="morePick(b)">
+            <span class="wm-idx">{{ i + 1 }}</span>
+            <span class="wm-name">{{ b.name }}</span>
+            <span class="wm-code" v-if="b.code">{{ b.code }}</span>
+            <span class="wm-sub" v-if="more.kind === 'board'">领涨 {{ b.leader }}
+              <i :class="pctClass(b.leader_pct)">{{ sign(b.leader_pct) }}%</i></span>
+            <span class="wm-sub" v-else-if="more.key === 'amount_stocks'">成交 {{ fmtAmt(b.amount) }}</span>
+            <span class="wm-sub" v-else-if="more.key === 'fast_stocks'">涨速 {{ sign(b.speed) }}%</span>
+            <span class="wm-sub" v-else>换手 {{ b.turnover }}%</span>
+            <span class="wm-price" v-if="b.price != null">{{ b.price }}</span>
+            <span class="wm-pct" :class="pctClass(b.pct)">{{ sign(b.pct) }}%</span>
+          </div>
+          <div v-if="!more.rows.length" class="watch-empty">暂无数据</div>
+        </template>
+      </div>
+    </div>
+  </div>
 </div>
 `,
     setup(props) {
@@ -229,6 +279,8 @@
       const loading = ref(false);
       const error = ref('');
       const idxSpark = ref({});        // 需求101805-0: 指数代码 -> [当日价格序列]
+      // 需求101807-0: 榜单「查看更多」弹层状态 (null = 关闭)
+      const more = ref(null);
 
       async function load() {
         if (loading.value) return;
@@ -282,9 +334,36 @@
       function openStock(s) { if (s && s.code) window.__openChart?.stock(s.code, s.name); }
       function openStockByCode(code, name) { if (code) window.__openChart?.stock(code, name); }
 
+      // 需求101807-0: 「查看更多」—— 拉取更长榜单 (板块/个股), 失败回落当前全景短榜
+      async function openMore(key) {
+        const title = MORE_TITLES[key] || key;
+        more.value = { key: key, title: title,
+                       kind: key === 'hot_boards' ? 'board' : 'stock',
+                       rows: [], mode: '', error: '', loading: true };
+        try {
+          const r = await api('/watch/list?key=' + encodeURIComponent(key) + '&limit=30');
+          const rows = (r && r.items && r.items.length)
+            ? r.items : (((data.value || {})[key]) || []);
+          more.value.rows = rows;
+          more.value.mode = (r && r.mode) || '';
+          more.value.error = (r && r.error) || '';
+        } catch (e) {
+          more.value.rows = ((data.value || {})[key]) || [];
+          more.value.mode = 'reserve';
+          more.value.error = e.message;
+        } finally { more.value.loading = false; }
+      }
+      function closeMore() { more.value = null; }
+      /** 弹层行点击 → 跳转行情模块展示该标的, 并关闭弹层 */
+      function morePick(b) {
+        if (more.value && more.value.kind === 'board') openBoard(b); else openStock(b);
+        closeMore();
+      }
+
       return { data, loading, error, load, pctClass, sign, nb, fmtAmt,
                idxSparkPath, idxSparkCls,
-               openIndex, openBoard, openStock, openStockByCode };
+               openIndex, openBoard, openStock, openStockByCode,
+               more, openMore, closeMore, morePick };
     },
   };
 })();

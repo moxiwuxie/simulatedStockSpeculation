@@ -617,7 +617,7 @@ _LIST_TTL = 60.0
 def _stock_rows(query: str, limit: int = 10, sort_key: str = "pct",
                 reverse: bool = True) -> List[Dict]:
     """智能选股查询 -> 归一化个股行 (按 ``sort_key`` 排序, 过滤本地无 K 线标的)"""
-    ck = f"{query}|{sort_key}|{reverse}"
+    ck = f"{query}|{sort_key}|{reverse}|{limit}"      # 需求101807-0: limit 参与键, 避免「查看更多」命中短榜缓存
     with _list_lock:
         hit = _LIST_CACHE.get(ck)
         if hit and time.time() - hit[0] < _LIST_TTL:
@@ -806,3 +806,69 @@ def _real_panorama_calc(seed: Optional[int] = None) -> Dict:
         "market_amount": _market_amount(sections["indices"]),   # 需求101805-2
         **sections,
     }
+
+
+# ==================== 需求101807-0: 榜单「查看更多」 ====================
+# 盘面每张榜单卡片默认展示 12 行; 点击「查看更多」按 section 键取更长榜单。
+_MORE_LIMIT_DEFAULT = 30
+_MORE_LIMIT_MAX = 60
+# section 键 -> (智能选股查询, 排序字段, 是否降序)
+_MORE_STOCK_SECTIONS: Dict[str, Tuple[str, str, bool]] = {
+    "gain_stocks": (_GAIN_QUERY, "pct", True),
+    "loss_stocks": (_LOSS_QUERY, "pct", False),
+    "fast_stocks": (_FAST_QUERY, "speed", True),
+    "amount_stocks": (_AMOUNT_QUERY, "amount", True),
+    "limit_up_today": (_LIMIT_UP_TODAY_QUERY, "pct", True),
+    "limit_up_prev": (_LIMIT_UP_PREV_QUERY, "pct", True),
+    "limit_down": (_LIMIT_DOWN_QUERY, "pct", False),
+    "zhaban": (_ZHABAN_QUERY, "pct", True),
+}
+# 板块榜最多展示的行数 (新浪行业板块池远大于热榜的 6 行)
+_BOARD_MORE_N = 40
+
+
+def _board_rows(limit: int) -> List[Dict]:
+    """行业板块榜 (按涨幅降序) 的长榜单, 结构同 hot_boards"""
+    pool = _live_board_pool(min(max(limit, _HOT_N), _BOARD_MORE_N))
+    if not pool:
+        raise _Unavailable("行业板块快照为空 (新浪板块列表不可用)")
+    netmap = _board_net_map([b["name"] for b in pool])
+    return [{
+        "name": b["name"],
+        "pct": round(float(b["pct"]), 2),
+        "leader": b.get("leader") or "--",
+        "leader_code": "",
+        "leader_pct": round(float(b.get("leader_pct") or 0.0), 2),
+        "net_in": netmap.get(b["name"]),
+    } for b in pool]
+
+
+def section_list(key: str, limit: int = _MORE_LIMIT_DEFAULT) -> Dict:
+    """需求101807-0: 按 section 键返回更长的榜单 (板块/个股)
+
+    实时取数失败时回落「全景缓存」中的同名短榜 (先展示已有数据 + 标注回落),
+    保证「查看更多」弹层永不空白; 未知 key 直接返回空榜。
+    """
+    key = (key or "").strip()
+    limit = max(1, min(int(limit or _MORE_LIMIT_DEFAULT), _MORE_LIMIT_MAX))
+    if key == "hot_boards":
+        kind = "board"
+        try:
+            items = _board_rows(limit)
+            return {"key": key, "limit": limit, "kind": kind, "items": items, "mode": "live"}
+        except Exception as e:                 # noqa: BLE001 - 逐段容错
+            cached = (_PANORAMA_CACHE.get("data") or {}).get("hot_boards") or []
+            return {"key": key, "limit": limit, "kind": kind, "items": cached,
+                    "mode": "reserve", "error": str(e)}
+    spec = _MORE_STOCK_SECTIONS.get(key)
+    if not spec:
+        return {"key": key, "limit": limit, "kind": "", "items": [], "mode": "",
+                "error": f"不支持的榜单: {key}"}
+    query, sort_key, reverse = spec
+    try:
+        items = _stock_rows(query, limit, sort_key, reverse)
+        return {"key": key, "limit": limit, "kind": "stock", "items": items, "mode": "live"}
+    except Exception as e:                     # noqa: BLE001 - 逐段容错
+        cached = (_PANORAMA_CACHE.get("data") or {}).get(key) or []
+        return {"key": key, "limit": limit, "kind": "stock", "items": cached,
+                "mode": "reserve", "error": str(e)}
