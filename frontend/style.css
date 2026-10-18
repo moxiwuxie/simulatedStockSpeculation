@@ -161,7 +161,7 @@ input { font-family: inherit; outline: none; }
 /* ============ 侧边栏 ============ */
 .sidebar {
   width: 260px; background: var(--panel); border-right: 1px solid var(--border);
-  display: flex; flex-direction: column; overflow: hidden;
+  display: flex; flex-direction: column; overflow: hidden; position: relative;
 }
 .search-box { position: relative; padding: 12px; }
 .search-box input {
@@ -210,7 +210,7 @@ input { font-family: inherit; outline: none; }
 
 /* ============ 主内容区 ============ */
 .main-content { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
-.pane { flex: 1; display: flex; flex-direction: column; padding: 16px; overflow: hidden; min-height: 0; }
+.pane { flex: 1; display: flex; flex-direction: column; padding: 16px; overflow: hidden; min-height: 0; position: relative; }
 .empty-hint { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-mute); font-size: 14px; }
 
 /* ============ 股票头部 ============ */
@@ -1514,6 +1514,16 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 .help-q:hover::after { opacity: 1; visibility: visible; }
 /* 视口右侧的入口(齿轮/靠右 Tab)提示向左收, 避免溢出 */
 .tab-spacer ~ * .help-q::after, .acct-fab .help-q::after { left: auto; right: 0; transform: none; }
+
+/* ===== 需求101803-0: 模块问号从顶部 Tab 移至各模块页面右上角 ===== */
+.pane-help {
+  position: absolute; top: 12px; right: 16px; z-index: 20; margin-left: 0;
+  width: 18px; height: 18px; font-size: 11px;
+}
+.pane-help::after { left: auto; right: 0; transform: none; }
+/* 右上角问号所在行: 首行内容为其让位, 避免遮挡右侧控件 */
+.chart-header, .watch-head, .lw-head, .setup-title, .blind-head { padding-right: 28px; }
+.app-body.wl-module .search-box { padding-right: 42px; }
 
 /* ===== 需求101801-0: 首次登录引导 ===== */
 .onboard-mask {

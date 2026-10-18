@@ -126,6 +126,11 @@ const app = createApp({
               tip: '复盘：训练与模拟交易的成绩统计、成长曲线与历史记录回顾。' },
         ];
         const activeTab = ref('kline');
+        /** 需求101803-0: 模块页面右上角「?」的说明文案 (取自 tab.tip) */
+        function tabTip(id) {
+            const t = tabs.find(x => x.id === id);
+            return t ? t.tip : '';
+        }
 
         const searchKw = ref('');
         const searchResults = ref({ stocks: [], boards: [] });   // 聚合搜索结果 (个股 + 板块)
@@ -256,15 +261,20 @@ const app = createApp({
         // ---------- 需求101801-0: 首次登录引导 ----------
         const onboardOpen = ref(false);
         const onboardStep = ref(0);
+        // 需求101803-2: 引导按模块逐一说明, 不做合并
         const onboardSteps = [
             { icon: '🎯', title: '训练 · 零风险盘感训练', tab: 'train',
-              desc: '从「训练」进入：选品类(股票双盲/长周期) → 设根数与标的 → 点「准备开始训练」。逐根 K 线推进，每根做【买入 / 卖出 / 观望】决策，到末尾自动结算；双盲模式训练中隐藏标的与日期，结束后揭晓，成绩可在「复盘」查看。' },
+              desc: '从「训练」进入：选品类(股票双盲/长周期/妖股等) → 设根数与标的 → 点「准备开始训练」。逐根 K 线推进，每根做【买入 / 卖出 / 观望】决策，到末尾自动结算；双盲模式训练中隐藏标的与日期，结束后揭晓，成绩可在「复盘」查看。' },
             { icon: '💹', title: '模拟交易 · 真实行情下单演练', tab: 'live',
-              desc: '从「模拟交易」进入：使用真实行情做零资金风险的买卖委托，账户资金 / 持仓 / 委托 / 成交流水实时更新，盈亏与风控指标一目了然。' },
-            { icon: '⭐', title: '自选与图表 · 盯住你关注的标的', tab: 'kline',
-              desc: '在「自选」中按分组管理个股 / 板块 / 指数(单击选中、双击看详情)，也可用动态分组按指标实时筛选；「图表」中查看 K 线 + 分时 + 指标，支持切换周期。' },
-            { icon: '📡', title: '看盘与复盘 · 复盘你的每一步', tab: 'watch',
-              desc: '「看盘」提供全市场快照与板块 / 指数全景，快速看清当日强弱；「复盘」汇总训练与模拟交易的成绩统计、成长曲线与历史记录。' },
+              desc: '从「模拟交易」进入：使用真实行情做零资金风险的买卖委托，先选资金体系，再搜索标的、填价格与数量下单；账户资金 / 持仓 / 委托 / 成交流水实时更新，盈亏与风控指标一目了然。' },
+            { icon: '⭐', title: '自选 · 分组管理关注的标的', tab: 'kline',
+              desc: '在「自选」中按分组管理个股 / 板块 / 指数，单击选中、双击看详情；可新建自选分组，或用动态分组按指标实时筛选；也支持从 txt/csv/tsv/json 文件导入自选。' },
+            { icon: '📈', title: '图表 · K 线与分时', tab: 'chart',
+              desc: '从「图表」进入：查看选中标的的 K 线 + 分时 + 指标(MACD/均线)，可切换周期与单根查看；左侧抽屉可收起 / 拉出分组个股，板块与指数有专属视图，右侧常驻模拟交易下单面板。' },
+            { icon: '📡', title: '看盘 · 全市场快照', tab: 'watch',
+              desc: '「看盘」聚合同花顺 / 开盘啦结构：国内指数、日韩美股、市场宽度、异动板块与昨日涨停股一屏看清当日强弱，点击可跳转到「图表」查看。' },
+            { icon: '📊', title: '复盘 · 回顾每一步成绩', tab: 'review',
+              desc: '「复盘」按「训练 / 模拟交易」双子页汇总成绩统计、成长曲线、胜率与盈亏分布，支持按品类 / 战法 / 时间维度筛选历史明细。' },
         ];
         // 需求101801-2: 操作手册 (文档集)
         const manualDocId = ref('quickstart');
@@ -350,10 +360,19 @@ const app = createApp({
         const manualDoc = computed(() =>
             manualDocs.find(d => d.id === manualDocId.value) || manualDocs[0]);
 
-        /** 引导展示标记按账号隔离: 同一账号只提示一次 */
+        /** 需求101803-1: 设备标识(每台设备/浏览器一个, 持久保存在 localStorage) */
+        function deviceId() {
+            let id = null;
+            try { id = localStorage.getItem('device_id'); } catch (e) {}
+            if (!id) {
+                id = 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+                try { localStorage.setItem('device_id', id); } catch (e) {}
+            }
+            return id;
+        }
+        /** 需求101803-1: 引导展示标记按 device-id 隔离 —— 同一设备只展示一次 */
         function onboardKey() {
-            const u = user.value;
-            return 'onboard_done_' + (u && u.user_id ? u.user_id : 'guest');
+            return 'onboard_done_' + deviceId();
         }
         function maybeOnboard(force) {
             if (!isLoggedIn.value) return;
@@ -2223,6 +2242,7 @@ const app = createApp({
             settingsOpen, settingsTab, openSettings, theme, setTheme,
             // 需求101801: 首次登录引导 + 操作手册(文档集)
             onboardOpen, onboardStep, onboardSteps, onboardGo, onboardGoTab, closeOnboard, maybeOnboard,
+            tabTip,
             manualDocs, manualDocId, manualDoc,
             importFile, triggerImport, onImportFile,
             selectedStock, selectedKlineDate, indexList, selectIndex, loadIndexList,

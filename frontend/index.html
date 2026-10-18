@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>历史回放交易系统</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="style.css?v=72">
+<link rel="stylesheet" href="style.css?v=73">
 <!-- Vue 3 global build (包含 template compiler) -->
-<script src="vendor/vue.global.js?v=72"></script>
+<script src="vendor/vue.global.js?v=73"></script>
 <!-- ECharts -->
-<script src="vendor/echarts.min.js?v=72"></script>
+<script src="vendor/echarts.min.js?v=73"></script>
 </head>
 <body>
 
@@ -17,12 +17,11 @@
   <!-- ============ 顶部 Tab 栏 (账户为右上角圆形入口) ============ -->
   <nav class="tab-bar">
     <div class="tab-group">
-      <!-- 需求101801-1: 关键功能入口「?」悬浮提示 -->
+      <!-- 需求101803-0: 关键功能入口「?」已从顶部 Tab 移至各模块页面右上角 -->
       <div v-for="tab in tabs" :key="tab.id"
            :class="['tab', tab.cls, {active: activeTab === tab.id}]"
            @click="switchTab(tab.id)">
         {{ tab.icon }} {{ tab.label }}
-        <span class="help-q" :data-tip="tab.tip" @click.stop>?</span>
       </div>
     </div>
     <div class="tab-spacer"></div>
@@ -46,6 +45,8 @@
            collapsed: activeTab === 'chart' && !drawerOpen
          }"
          v-show="activeTab === 'kline' || activeTab === 'chart'">
+    <!-- 需求101803-0: 自选模块页面右上角「?」说明 -->
+    <span v-if="activeTab === 'kline'" class="help-q pane-help" :data-tip="tabTip('kline')">?</span>
     <div class="search-box">
       <input type="text" v-model="searchKw" placeholder="🔍 股票/板块 代码·名称·首字母" @input="debounceSearch">
       <div v-if="searchKw && (searchResults.stocks.length || searchResults.boards.length)" class="search-results">
@@ -162,6 +163,8 @@
 
     <!-- ===== 图表模块: K线 + 分时 (需求7 从自选模块拆分独立展示; v-show 保证 ECharts 容器始终在 DOM 且有尺寸) ===== -->
     <section v-show="activeTab === 'chart'" class="pane kline-pane">
+      <!-- 需求101803-0: 图表模块页面右上角「?」说明 -->
+      <span class="help-q pane-help" :data-tip="tabTip('chart')">?</span>
       <div v-if="selectedStock" class="kline-inner">
         <div class="chart-header">
           <div class="ch-left">
@@ -247,21 +250,29 @@
 
     <!-- ===== 模拟交易 Tab ===== -->
     <section v-show="activeTab === 'live'" class="pane no-pad">
+      <!-- 需求101803-0: 模拟交易模块页面右上角「?」说明 -->
+      <span class="help-q pane-help" :data-tip="tabTip('live')">?</span>
       <live-pane :active="activeTab === 'live'"></live-pane>
     </section>
 
     <!-- ===== 训练 Tab ===== -->
     <section v-show="activeTab === 'train'" class="pane no-pad">
+      <!-- 需求101803-0: 训练模块页面右上角「?」说明 -->
+      <span class="help-q pane-help" :data-tip="tabTip('train')">?</span>
       <train-pane :active="activeTab === 'train'"></train-pane>
     </section>
 
     <!-- ===== 看盘 Tab (聚合同花顺/开盘啦结构, 功能储备) ===== -->
     <section v-show="activeTab === 'watch'" class="pane no-pad">
+      <!-- 需求101803-0: 看盘模块页面右上角「?」说明 -->
+      <span class="help-q pane-help" :data-tip="tabTip('watch')">?</span>
       <watch-pane :active="activeTab === 'watch'"></watch-pane>
     </section>
 
     <!-- ===== 复盘 Tab ===== -->
     <section v-show="activeTab === 'review'" class="pane no-pad">
+      <!-- 需求101803-0: 复盘模块页面右上角「?」说明 -->
+      <span class="help-q pane-help" :data-tip="tabTip('review')">?</span>
       <review-pane :active="activeTab === 'review'"></review-pane>
     </section>
 
@@ -565,8 +576,8 @@
     </div>
   </div>
 
-  <!-- ============ 需求101801-0: 首次登录引导 (核心流程: 训练 / 模拟交易 / 自选图表 / 看盘复盘) ============ -->
-  <div v-if="onboardOpen" class="onboard-mask" @click.self="closeOnboard(false)">
+  <!-- ============ 需求101801-0/101803-2: 首次登录引导 (按模块逐一说明: 训练 / 模拟交易 / 自选 / 图表 / 看盘 / 复盘) ============ -->
+  <div v-if="onboardOpen" class="onboard-mask" @click.self="closeOnboard(true)">
     <div class="onboard-panel">
       <div class="onboard-head">
         <span>🧭 首次使用引导</span>
@@ -582,7 +593,8 @@
         </div>
       </div>
       <div class="onboard-foot">
-        <button class="btn mini ghost" @click="closeOnboard(false)">稍后</button>
+        <!-- 需求101803-3: 「稍后」文案改为「忽略」; 点击即视为已完成该设备引导 -->
+        <button class="btn mini ghost" @click="closeOnboard(true)">忽略</button>
         <span class="spacer"></span>
         <button v-if="onboardStep > 0" class="btn mini ghost" @click="onboardGo(onboardStep - 1)">上一步</button>
         <button v-if="onboardStep < onboardSteps.length - 1" class="btn mini primary" @click="onboardGo(onboardStep + 1)">下一步</button>
@@ -592,12 +604,12 @@
   </div>
 </div>
 
-<script src="preload.js?v=72"></script>
-<script src="indicators.js?v=72"></script>
-<script src="live.js?v=72"></script>
-<script src="train.js?v=72"></script>
-<script src="review.js?v=72"></script>
-<script src="watch.js?v=72"></script>
-<script src="app.js?v=72"></script>
+<script src="preload.js?v=73"></script>
+<script src="indicators.js?v=73"></script>
+<script src="live.js?v=73"></script>
+<script src="train.js?v=73"></script>
+<script src="review.js?v=73"></script>
+<script src="watch.js?v=73"></script>
+<script src="app.js?v=73"></script>
 </body>
 </html>
