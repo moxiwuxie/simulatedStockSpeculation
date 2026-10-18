@@ -878,6 +878,8 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   .train-wrap { padding: 10px; }
   .train-setup { max-width: 100%; }
   .train-right { min-width: 0; }
+  /* 需求101806-1: 手机侧操作优先 —— 买入/卖出/观望操作区前移, 图表后置 (无需下滑即可决策) */
+  .train-run > .train-main { order: 10; }
   .train-right .train-intraday { min-height: 240px; }
   .act-bar { gap: 6px; }
   .act-bar .btn { flex: 1 1 40%; }
@@ -892,6 +894,8 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   .attr-reason-flow li { flex-wrap: wrap; }
   .attr-reason-flow li b { flex: 0 0 100%; }
   .live-wrap { padding: 10px; }
+  /* 需求101806: 盘面手机侧收紧内边距, 长列表(热点板块/个股榜单)可纵向滑动 */
+  .watch-wrap { padding: 10px; gap: 10px; }
   .lw-split > .lw-card { flex: 1 1 100%; }
   .tb-input { width: 88px; }
   .tb-row .btn.primary { flex: 1 1 100%; }
@@ -1050,7 +1054,11 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
              border: 1px solid var(--panel); }
 
 /* ============ 看盘模块 (聚合同花顺/开盘啦) ============ */
-.watch-wrap { padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+/* 需求101806-0: 盘面为长页面 —— 需自身纵向滚动, 否则 .pane(overflow:hidden) 会裁掉
+   指数以下的热点板块/个股榜单 (手机侧表现: 无法上下滑动 + 只看到指数) */
+.watch-wrap { flex: 1; min-height: 0; padding: 12px; display: flex; flex-direction: column;
+              gap: 12px; overflow-y: auto; overscroll-behavior: contain;
+              -webkit-overflow-scrolling: touch; }
 .watch-head { display: flex; align-items: center; gap: 10px; }
 .watch-title { font-size: 15px; font-weight: 600; color: var(--text-strong); }
 .watch-title .sub { font-size: 12px; font-weight: 400; color: var(--text-dim); margin-left: 6px; }
