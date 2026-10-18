@@ -2202,15 +2202,17 @@ const app = createApp({
         // 供其它组件 (如模拟交易下单面板信息卡) 跳转行情页: 不加入任何自选/分类
         window.__gotoStock = selectStock;
 
-        // 需求5: 看盘模块 (watch.js 独立组件) 点击指数/板块/个股 → 跳转「图表」模块展示
+        // 需求5 / 需求101805-1: 看盘模块 (watch.js 独立组件) 点击指数/板块/个股 → 跳转「行情」模块展示
         window.__openChart = {
             index: (code, name, price, pct) => selectIndex({ code, name, price, pct }),
             stock: (code, name) => selectStock({ code, name, price: 0, market: marketOf(code) }),
-            board: async (name) => {
+            // 板块处理与自选分组对板块的处理一致 (统一走 selectBoard); kind 为板块类型提示
+            board: async (name, kind) => {
                 try {
-                    const r = await api('/boards/search?kw=' + encodeURIComponent(name) + '&limit=1');
-                    const b = (r.boards || [])[0];
-                    if (b) selectBoard({ name: b.name, label: b.label }, b.kind);
+                    const r = await api('/boards/search?kw=' + encodeURIComponent(name) + '&limit=5');
+                    const list = r.boards || [];
+                    const b = (kind ? list.find(x => x.kind === kind) : null) || list[0];
+                    if (b) selectBoard({ name: b.name, label: b.label }, b.kind || kind);
                 } catch(e) { console.warn('板块跳转失败:', e.message); }
             },
         };

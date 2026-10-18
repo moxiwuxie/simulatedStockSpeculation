@@ -1,9 +1,13 @@
 /**
- * 看盘 Tab —— 自有看盘界面 (数据源: 同花顺 iFinD)
+ * 看盘(盘面) Tab —— 自有看盘界面 (数据源: 同花顺 iFinD)
  *
  * 后端 /api/watch/panorama 优先返回 iFinD 实时数据 (mode='live'); 密钥缺失或取数
  * 失败时逐板块回落占位快照 (mode='reserve', 带 errors 说明), 前端据此展示真实/占位标签。
- * 界面结构 (国内指数 / 日韩美股 / 涨跌家数 / 异动板块 / 异动个股 / 涨停·跌停·炸板) 对两种模式通用。
+ * 界面结构 (国内指数 / 日韩美股 / 涨跌家数 + A股总成交额 / 热点板块 /
+ * 涨幅·跌幅·快速涨幅·成交额 / 涨停·跌停·炸板) 对两种模式通用。
+ *
+ * 需求101805: 指数分时缩略图 (0)、指数/板块点击跳行情 (1)、涨跌家数下方总成交额 (2)、
+ * 个股四榜排序 (3)、板块按热点定位按涨幅展示 (4)。
  */
 (function () {
   'use strict';
@@ -51,7 +55,7 @@
   <div v-if="error" class="err-box">{{ error }}</div>
 
   <template v-if="data">
-    <!-- 国内指数 -->
+    <!-- 国内指数 (需求101805-0: 指数分时缩略图) -->
     <div class="watch-block-title">国内指数</div>
     <div class="watch-indices">
       <div v-for="ix in data.indices" :key="ix.code" class="widx-card clickable"
@@ -59,6 +63,10 @@
         <div class="widx-name">{{ ix.name }} <span class="widx-code">{{ ix.code }}</span></div>
         <div class="widx-price" :class="pctClass(ix.pct)">{{ ix.price }}</div>
         <div class="widx-pct" :class="pctClass(ix.pct)">{{ sign(ix.pct) }}% · {{ fmtAmt(ix.amount) }}</div>
+        <svg v-if="idxSparkPath(ix.code)" class="widx-spark" :class="idxSparkCls(ix.code)"
+             viewBox="0 0 60 20" preserveAspectRatio="none">
+          <polyline :points="idxSparkPath(ix.code)"></polyline>
+        </svg>
       </div>
     </div>
 
@@ -73,7 +81,7 @@
       </div>
     </div>
 
-    <!-- 涨跌家数 -->
+    <!-- 涨跌家数 (需求101805-2: 下方展示当日A股总成交额) -->
     <div class="watch-breadth">
       <div class="wb-cell"><span>上涨</span><b class="up">{{ data.breadth.up }}</b></div>
       <div class="wb-cell"><span>下跌</span><b class="down">{{ data.breadth.down }}</b></div>
@@ -83,11 +91,15 @@
       <div class="wb-cell"><span>炸板</span><b class="warn">{{ nb(data.breadth.zhaban) }}</b></div>
       <div class="wb-cell"><span>停牌</span><b>{{ data.breadth.suspended }}</b></div>
     </div>
+    <div class="watch-amount" v-if="data.market_amount != null">
+      <span>当日A股总成交额</span><b>{{ fmtAmt(data.market_amount) }}</b>
+      <span class="wc-note">沪深北三市综合指数合计</span>
+    </div>
 
+    <!-- 需求101805-4: 热点板块 (按涨幅降序) + 需求101805-3: 涨幅榜 -->
     <div class="watch-cols">
-      <!-- 异动板块 -->
       <div class="watch-card">
-        <div class="watch-card-title">🔥 异动板块</div>
+        <div class="watch-card-title">🔥 热点板块 <span class="wc-note">按涨幅排序 · 点击查看板块行情</span></div>
         <div v-for="b in data.hot_boards" :key="b.name" class="wb-row clickable"
              title="点击查看该板块K线/分时" @click="openBoard(b)">
           <span class="wb-name">{{ b.name }}</span>
@@ -98,10 +110,9 @@
         </div>
       </div>
 
-      <!-- 异动个股 (涨幅排序) -->
       <div class="watch-card">
-        <div class="watch-card-title up">📈 异动个股 <span class="wc-note">涨幅排序</span></div>
-        <div v-for="s in data.hot_stocks" :key="'hs' + s.code" class="wr-row clickable"
+        <div class="watch-card-title up">📈 涨幅榜 <span class="wc-note">按涨幅排序</span></div>
+        <div v-for="s in data.gain_stocks" :key="'g' + s.code" class="wr-row clickable"
              title="点击查看该股K线/分时" @click="openStock(s)">
           <span class="wr-name">{{ s.name }}</span>
           <span class="wr-code">{{ s.code }}</span>
@@ -112,8 +123,47 @@
       </div>
     </div>
 
+    <!-- 需求101805-3: 跌幅榜 (最跌在前) + 快速涨幅 -->
     <div class="watch-cols">
-      <!-- 当日涨停股 -->
+      <div class="watch-card">
+        <div class="watch-card-title down">📉 跌幅榜 <span class="wc-note">按跌幅排序</span></div>
+        <div v-for="s in data.loss_stocks" :key="'l' + s.code" class="wr-row clickable"
+             title="点击查看该股K线/分时" @click="openStock(s)">
+          <span class="wr-name">{{ s.name }}</span>
+          <span class="wr-code">{{ s.code }}</span>
+          <span class="wr-price">{{ s.price }}</span>
+          <span class="wr-turn">换手 {{ s.turnover }}%</span>
+          <span class="wr-pct" :class="pctClass(s.pct)">{{ sign(s.pct) }}%</span>
+        </div>
+      </div>
+
+      <div class="watch-card">
+        <div class="watch-card-title up">⚡ 快速涨幅 <span class="wc-note">按5日涨速排序</span></div>
+        <div v-for="s in data.fast_stocks" :key="'f' + s.code" class="wr-row clickable"
+             title="点击查看该股K线/分时" @click="openStock(s)">
+          <span class="wr-name">{{ s.name }}</span>
+          <span class="wr-code">{{ s.code }}</span>
+          <span class="wr-price">{{ s.price }}</span>
+          <span class="wr-turn">涨速 {{ sign(s.speed) }}%</span>
+          <span class="wr-pct" :class="pctClass(s.pct)">{{ sign(s.pct) }}%</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 需求101805-3: 成交额榜 + 当日涨停股 -->
+    <div class="watch-cols">
+      <div class="watch-card">
+        <div class="watch-card-title">💰 成交额榜 <span class="wc-note">按成交额排序</span></div>
+        <div v-for="s in data.amount_stocks" :key="'a' + s.code" class="wr-row clickable"
+             title="点击查看该股K线/分时" @click="openStock(s)">
+          <span class="wr-name">{{ s.name }}</span>
+          <span class="wr-code">{{ s.code }}</span>
+          <span class="wr-price">{{ s.price }}</span>
+          <span class="wr-turn">{{ fmtAmt(s.amount) }}</span>
+          <span class="wr-pct" :class="pctClass(s.pct)">{{ sign(s.pct) }}%</span>
+        </div>
+      </div>
+
       <div class="watch-card">
         <div class="watch-card-title up">🚀 当日涨停股 <span class="wc-note">点击查看K线</span></div>
         <div v-for="s in data.limit_up_today" :key="'lu' + s.code" class="wr-row clickable"
@@ -125,7 +175,9 @@
           <span class="wr-pct up">{{ sign(s.pct) }}%</span>
         </div>
       </div>
+    </div>
 
+    <div class="watch-cols">
       <!-- 昨日涨停股 -->
       <div class="watch-card">
         <div class="watch-card-title">🕘 昨日涨停股 <span class="wc-note">点击查看K线</span></div>
@@ -138,9 +190,7 @@
           <span class="wr-pct" :class="pctClass(s.pct)">{{ sign(s.pct) }}%</span>
         </div>
       </div>
-    </div>
 
-    <div class="watch-cols">
       <!-- 跌停股 -->
       <div class="watch-card">
         <div class="watch-card-title down">📉 跌停股 <span class="wc-note">点击查看K线</span></div>
@@ -153,7 +203,9 @@
           <span class="wr-pct down">{{ sign(s.pct) }}%</span>
         </div>
       </div>
+    </div>
 
+    <div class="watch-cols">
       <!-- 炸板股 -->
       <div class="watch-card">
         <div class="watch-card-title warn">💥 炸板股 <span class="wc-note">点击查看K线</span></div>
@@ -176,26 +228,62 @@
       const data = ref(null);
       const loading = ref(false);
       const error = ref('');
+      const idxSpark = ref({});        // 需求101805-0: 指数代码 -> [当日价格序列]
 
       async function load() {
         if (loading.value) return;
         loading.value = true; error.value = '';
-        try { data.value = await api('/watch/panorama'); }
+        try {
+          data.value = await api('/watch/panorama');
+          loadIdxSparks();
+        }
         catch (e) { error.value = '❌ ' + e.message; }
         finally { loading.value = false; }
+      }
+
+      // 需求101805-0: 拉取指数条分时缩略图 (后端等距下采样至 ≤48 点)
+      async function loadIdxSparks() {
+        const codes = (data.value?.indices || []).map(x => x.code).filter(Boolean);
+        if (!codes.length) { idxSpark.value = {}; return; }
+        try {
+          const r = await api('/watch/index-sparklines?codes=' + codes.join(','));
+          idxSpark.value = (r && r.items) || {};
+        } catch (e) { console.warn('指数缩略图加载失败:', e.message); }
+      }
+      /** 价格序列 → SVG polyline 坐标串 (viewBox 0 0 60 20, min-max 归一化) */
+      function idxSparkPath(code) {
+        const arr = (idxSpark.value || {})[code];
+        if (!arr || arr.length < 2) return '';
+        let lo = Infinity, hi = -Infinity;
+        for (const v of arr) { if (v < lo) lo = v; if (v > hi) hi = v; }
+        const span = (hi - lo) || 1;
+        const n = arr.length;
+        return arr.map((v, i) => {
+          const x = (i / (n - 1)) * 60;
+          const y = 18 - ((v - lo) / span) * 16;
+          return x.toFixed(1) + ',' + y.toFixed(1);
+        }).join(' ');
+      }
+      /** 末点≥首点 → up(红), 否则 down(绿) */
+      function idxSparkCls(code) {
+        const arr = (idxSpark.value || {})[code];
+        if (!arr || arr.length < 2) return '';
+        return arr[arr.length - 1] >= arr[0] ? 'up' : 'down';
       }
 
       // 看盘数据取数较重 (iFinD 多次调用), 仅在切到本 Tab 时加载
       onMounted(function () { if (props.active) load(); });
       watch(function () { return props.active; }, function (v) { if (v && !data.value) load(); });
 
-      // 需求5: 点击指数/板块/个股 → 跳转「图表」模块展示对应 K线/分时
+      // 需求101805-1: 点击指数/板块/个股 → 跳转「行情」模块展示对应 K线/分时
+      // 板块跳转与自选分组对板块的处理一致 (经 __openChart.board → selectBoard)
       function openIndex(ix) { window.__openChart?.index(ix.code, ix.name, ix.price, ix.pct); }
-      function openBoard(b) { if (b && b.name) window.__openChart?.board(b.name); }
+      function openBoard(b) { if (b && b.name) window.__openChart?.board(b.name, 'industry'); }
       function openStock(s) { if (s && s.code) window.__openChart?.stock(s.code, s.name); }
       function openStockByCode(code, name) { if (code) window.__openChart?.stock(code, name); }
 
       return { data, loading, error, load, pctClass, sign, nb, fmtAmt,
+               idxSparkPath, idxSparkCls,
                openIndex, openBoard, openStock, openStockByCode };
     },
   };

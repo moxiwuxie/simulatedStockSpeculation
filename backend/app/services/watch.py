@@ -30,9 +30,13 @@ LIVE_SOURCE = "同花顺 iFinD"
 
 # 看盘界面覆盖的板块 (顺序即前端展示顺序)
 SECTIONS = (
-    "indices", "foreign", "breadth", "hot_boards", "hot_stocks",
+    "indices", "foreign", "breadth", "hot_boards",
+    "gain_stocks", "loss_stocks", "fast_stocks", "amount_stocks",
     "limit_up_today", "limit_up_prev", "limit_down", "zhaban",
 )
+
+# 需求101805-2: A股总成交额 —— 沪深北三市综合指数成交额之和 (元)
+_MARKET_AMOUNT_CODES = ("000001", "399001", "899050")
 
 _INDEX_LIST = [
     ("上证指数", "000001"), ("深证成指", "399001"), ("创业板指", "399006"),
@@ -126,7 +130,7 @@ def _section_hot_boards(r: random.Random) -> List[Dict]:
 
 
 def _section_stock_list(r: random.Random, kind: str, n: int = 10) -> List[Dict]:
-    """涨停/跌停/炸板/异动个股占位快照 (按涨跌幅降序)"""
+    """涨停/跌停/炸板/个股榜占位快照 (按各自指标排序)"""
     pool = _STOCK_POOL[:]
     r.shuffle(pool)
     out = []
@@ -135,8 +139,12 @@ def _section_stock_list(r: random.Random, kind: str, n: int = 10) -> List[Dict]:
             pct = round(r.uniform(9.8, 10.05), 2)
         elif kind == "limit_down":
             pct = round(r.uniform(-10.05, -9.8), 2)
+        elif kind == "loss":
+            pct = round(r.uniform(-11, -3), 2)
         elif kind == "zhaban":
             pct = round(r.uniform(-3, 6), 2)
+        elif kind == "fast":
+            pct = round(r.uniform(1, 10), 2)
         else:
             pct = round(r.uniform(3, 11), 2)
         out.append({
@@ -144,24 +152,38 @@ def _section_stock_list(r: random.Random, kind: str, n: int = 10) -> List[Dict]:
             "price": round(r.uniform(5, 300), 2),
             "pct": pct,
             "turnover": round(r.uniform(0.5, 35), 2),         # 换手率 %
+            "amount": round(r.uniform(5, 200) * 1e8, 2),      # 成交额 (元)
+            "speed": round(r.uniform(0.2, 3.5), 2),           # 5分钟涨速 %
         })
-    out.sort(key=lambda x: x["pct"], reverse=True)
+    if kind == "loss":
+        out.sort(key=lambda x: x["pct"])                      # 跌幅榜: 最跌在前
+    elif kind == "fast":
+        out.sort(key=lambda x: x["speed"], reverse=True)      # 快速涨幅榜
+    elif kind == "amount":
+        out.sort(key=lambda x: x["amount"], reverse=True)     # 成交额榜
+    else:
+        out.sort(key=lambda x: x["pct"], reverse=True)
     return out
 
 
 def mock_panorama(seed: Optional[int] = None) -> Dict:
     """看盘全景快照 (功能储备: 占位数据, 不实际抓取)"""
     r = _rng(seed)
+    idx = _section_indices(r)
     return {
         "mode": "reserve",                       # 功能储备: 前端据此展示占位提示
         "sources": list(SOURCES),
         "sections": list(SECTIONS),
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "indices": _section_indices(r),
+        "indices": idx,
         "foreign": _section_foreign(r),
         "breadth": _section_breadth(r),
+        "market_amount": _market_amount(idx),
         "hot_boards": _section_hot_boards(r),
-        "hot_stocks": _section_stock_list(r, "hot", 12),
+        "gain_stocks": _section_stock_list(r, "hot", 12),
+        "loss_stocks": _section_stock_list(r, "loss", 12),
+        "fast_stocks": _section_stock_list(r, "fast", 12),
+        "amount_stocks": _section_stock_list(r, "amount", 12),
         "limit_up_today": _section_stock_list(r, "limit_up"),
         "limit_up_prev": _section_stock_list(r, "limit_up"),
         "limit_down": _section_stock_list(r, "limit_down"),
@@ -169,6 +191,15 @@ def mock_panorama(seed: Optional[int] = None) -> Dict:
         "live_sections": [],
         "errors": [],
     }
+
+
+def _market_amount(indices: List[Dict]) -> float:
+    """需求101805-2: A股总成交额 = 沪深北三市综合指数成交额之和 (元)"""
+    total = 0.0
+    for ix in indices or []:
+        if str(ix.get("code")) in _MARKET_AMOUNT_CODES:
+            total += float(ix.get("amount") or 0.0)
+    return round(total, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -555,8 +586,11 @@ def _live_hot_boards() -> List[Dict]:
     return _board_bundle()
 
 
-# 智能选股查询 (异动个股 / 涨停 / 昨日涨停 / 跌停 / 炸板)
+# 智能选股查询 (个股榜 / 涨停 / 昨日涨停 / 跌停 / 炸板)
 _GAIN_QUERY = "今日涨幅前20的A股股票，含最新价、涨跌幅、换手率、成交额"
+_LOSS_QUERY = "今日跌幅前20的A股股票，含最新价、涨跌幅、换手率、成交额"
+_FAST_QUERY = "今日盘中涨速最快的A股股票，含最新价、涨跌幅、涨速、换手率"
+_AMOUNT_QUERY = "今日成交额最大的A股股票，含最新价、涨跌幅、换手率、成交额"
 _LIMIT_UP_TODAY_QUERY = "今日涨停的A股股票，含最新价、涨跌幅、换手率"
 _LIMIT_UP_PREV_QUERY = "昨日涨停的A股股票，含最新价、涨跌幅、换手率"
 _LIMIT_DOWN_QUERY = "今日跌停的A股股票，含最新价、涨跌幅、换手率"
@@ -580,10 +614,12 @@ _LIST_CACHE: Dict[str, Any] = {}
 _LIST_TTL = 60.0
 
 
-def _stock_rows(query: str, limit: int = 10) -> List[Dict]:
-    """智能选股查询 -> 归一化个股行 (按涨跌幅降序, 过滤本地无 K 线标的)"""
+def _stock_rows(query: str, limit: int = 10, sort_key: str = "pct",
+                reverse: bool = True) -> List[Dict]:
+    """智能选股查询 -> 归一化个股行 (按 ``sort_key`` 排序, 过滤本地无 K 线标的)"""
+    ck = f"{query}|{sort_key}|{reverse}"
     with _list_lock:
-        hit = _LIST_CACHE.get(query)
+        hit = _LIST_CACHE.get(ck)
         if hit and time.time() - hit[0] < _LIST_TTL:
             return hit[1]
     _pace()
@@ -601,6 +637,8 @@ def _stock_rows(query: str, limit: int = 10) -> List[Dict]:
             "price": round(_pick(row, "收盘价", "最新价", "现价", "price") or 0.0, 2),
             "pct": round(pct, 2),
             "turnover": round(_pick(row, "换手率", "turnover") or 0.0, 2),
+            "amount": _amount(_pick(row, "成交额", "amount")) or 0.0,
+            "speed": round(_pick(row, "涨速", "5日涨速", "5分钟涨速", "speed") or 0.0, 2),
         })
     if not rows:
         raise _Unavailable("智能选股返回为空")
@@ -609,18 +647,33 @@ def _stock_rows(query: str, limit: int = 10) -> List[Dict]:
     reg = _registry()
     # 新股/北交所标的本地无 K 线数据, 点击看盘跳转会失败 —— 直接过滤, 保证榜上每只都可查看
     uniq = [r for r in uniq if reg.get(r["code"])]
-    uniq.sort(key=lambda x: x["pct"], reverse=True)
+    uniq.sort(key=lambda x: x.get(sort_key) or 0.0, reverse=reverse)
     out = uniq[:limit]
     if not out:
         raise _Unavailable("智能选股结果均为本地无 K 线标的")
     with _list_lock:
-        _LIST_CACHE[query] = (time.time(), out)
+        _LIST_CACHE[ck] = (time.time(), out)
     return out
 
 
-def _live_hot_stocks() -> List[Dict]:
-    """异动个股: 涨幅前列 (按涨跌幅降序)"""
-    return _stock_rows(_GAIN_QUERY, 12)
+def _live_gain_stocks() -> List[Dict]:
+    """需求101805-3: 涨幅榜 (按涨跌幅降序)"""
+    return _stock_rows(_GAIN_QUERY, 12, "pct", True)
+
+
+def _live_loss_stocks() -> List[Dict]:
+    """需求101805-3: 跌幅榜 (按涨跌幅升序, 最跌在前)"""
+    return _stock_rows(_LOSS_QUERY, 12, "pct", False)
+
+
+def _live_fast_stocks() -> List[Dict]:
+    """需求101805-3: 快速涨幅 (按涨速降序)"""
+    return _stock_rows(_FAST_QUERY, 12, "speed", True)
+
+
+def _live_amount_stocks() -> List[Dict]:
+    """需求101805-3: 成交额榜 (按成交额降序)"""
+    return _stock_rows(_AMOUNT_QUERY, 12, "amount", True)
 
 
 def _live_limit_up_today() -> List[Dict]:
@@ -734,7 +787,10 @@ def _real_panorama_calc(seed: Optional[int] = None) -> Dict:
         "foreign": _section("foreign", _live_foreign, _section_foreign(r)),
         "breadth": _section("breadth", _live_breadth, _section_breadth(r)),
         "hot_boards": _section("hot_boards", _live_hot_boards, _section_hot_boards(r)),
-        "hot_stocks": _section("hot_stocks", _live_hot_stocks, _section_stock_list(r, "hot", 12)),
+        "gain_stocks": _section("gain_stocks", _live_gain_stocks, _section_stock_list(r, "hot", 12)),
+        "loss_stocks": _section("loss_stocks", _live_loss_stocks, _section_stock_list(r, "loss", 12)),
+        "fast_stocks": _section("fast_stocks", _live_fast_stocks, _section_stock_list(r, "fast", 12)),
+        "amount_stocks": _section("amount_stocks", _live_amount_stocks, _section_stock_list(r, "amount", 12)),
         "limit_up_today": _section("limit_up_today", _live_limit_up_today, _section_stock_list(r, "limit_up")),
         "limit_up_prev": _section("limit_up_prev", _live_limit_up_prev, _section_stock_list(r, "limit_up")),
         "limit_down": _section("limit_down", _live_limit_down, _section_stock_list(r, "limit_down")),
@@ -747,5 +803,6 @@ def _real_panorama_calc(seed: Optional[int] = None) -> Dict:
         "live_sections": live,
         "errors": errors,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "market_amount": _market_amount(sections["indices"]),   # 需求101805-2
         **sections,
     }

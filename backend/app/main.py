@@ -1672,6 +1672,47 @@ def watch_panorama():
         return mock_panorama()
 
 
+# 指数分时缩略图缓存: code → (时间戳, 序列|None), 300s 内复用 (指数分时本身缓存 15 分钟)
+_INDEX_SPARK_CACHE: dict = {}
+_INDEX_SPARK_TTL = 300.0
+_INDEX_SPARK_MAX = 8
+
+
+@app.get("/api/watch/index-sparklines")
+def watch_index_sparklines(codes: str = Query("", max_length=400)):
+    """需求101805-0: 看盘指数条当日分时缩略图
+
+    返回 ``{"items": {code: [价格序列...]}}`` (等距下采样至 ≤48 点);
+    取不到分时数据的指数不出现在 items 中 (前端回落仅展示涨跌幅文本)。
+    """
+    want = [c.strip() for c in (codes or "").split(",") if c.strip()][:_INDEX_SPARK_MAX]
+    if not want:
+        return {"items": {}}
+    from .services.index_feed import index_intraday
+    now = time.time()
+    out: dict = {}
+    for code in want:
+        hit = _INDEX_SPARK_CACHE.get(code)
+        if hit and now - hit[0] < _INDEX_SPARK_TTL:
+            if hit[1]:
+                out[code] = hit[1]
+            continue
+        series = None
+        try:
+            data = index_intraday(code) or {}
+            pts = [p.get("price") for p in (data.get("points") or [])
+                   if p.get("price") is not None]
+            if len(pts) >= 5:
+                step = max(1, len(pts) // 48)
+                series = [round(float(p), 2) for p in pts[::step][:48]]
+        except Exception:                 # noqa: BLE001 - 缩略图非关键路径
+            series = None
+        _INDEX_SPARK_CACHE[code] = (now, series)
+        if series:
+            out[code] = series
+    return {"items": out}
+
+
 @app.get("/api/preload")
 def trigger_preload(force: bool = False):
     """需求101602: 触发后端预加载 —— 后台预热各重接口缓存, 立即返回进度
